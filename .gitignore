@@ -1,0 +1,8 @@
+.venv/
+.env
+.env.*
+!.env.example
+mcp.local.json
+__pycache__/
+.pytest_cache/
+*.pyc

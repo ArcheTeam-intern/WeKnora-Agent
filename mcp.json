@@ -1,0 +1,12 @@
+{
+  "weknora": {
+    "transport": "streamable_http",
+    "url": "${WEKNORA_MCP_URL}",
+    "headers": {
+      "Authorization": "Bearer ${WEKNORA_MCP_TOKEN}",
+      "X-WeKnora-User-Token": "${WEKNORA_USER_TOKEN}",
+      "X-Tenant-ID": "${WEKNORA_WORKSPACE_ID}",
+      "X-WeKnora-Knowledge-Base-Ids": "${WEKNORA_KB_IDS}"
+    }
+  }
+}
