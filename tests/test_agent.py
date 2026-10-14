@@ -38,7 +38,8 @@ def test_missing_env_fails_before_connecting(tmp_path, monkeypatch):
 
 def test_cli_missing_config_returns_nonzero_without_a_traceback(tmp_path):
     completed = subprocess.run([sys.executable, "main.py", "--question", "测试",
-                                "--mcp-config", str(tmp_path / "missing.json")],
+                                "--mcp-config", str(tmp_path / "missing.json"),
+                                "--env-file", str(tmp_path / "missing.env")],
                                cwd=Path(__file__).resolve().parents[1],
                                capture_output=True, text=True, encoding="utf-8",
                                env={**__import__("os").environ, "PYTHONUTF8": "1"})
