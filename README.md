@@ -1,8 +1,8 @@
 # WeKnora-Agent
 
-纯 LangChain Agent 原型：模型 + 标准 MCP 适配器 + CLI。MCP 为 Model Context Protocol。
+纯 LangChain Agent 原型：模型 + 标准 MCP 适配器，提供 CLI 与简易演示前端。MCP 为 Model Context Protocol。
 
-运行代码只有 `main.py` 和 `agent.py`。调用链为配置读取 → `ChatOpenAI` → `MultiServerMCPClient.get_tools()` → `create_agent` → `ainvoke` → 答案。框架负责模型与工具循环，不自建 Agent runtime 或 MCP 协议层。
+运行代码只有 `main.py`、`agent.py` 和 `webapp.py`（页面在 `web/index.html`）。调用链为配置读取 → `ChatOpenAI` → `MultiServerMCPClient.get_tools()` → `create_agent` → `ainvoke` → 答案。框架负责模型与工具循环，不自建 Agent runtime 或 MCP 协议层。
 
 文档上传、解析、RAG、Wiki、知识图谱、身份权限、任务状态和来源结构均在 WeKnora。资料管理继续使用 WeKnora UI（本机原型地址 `http://127.0.0.1:18180`）。本项目仅调用问答所需的只读 MCP 工具，包含 Wiki 和知识图谱。
 
@@ -29,6 +29,16 @@ Copy-Item .env.example .env
 # 编辑 .env，填写模型、MCP 和 WeKnora 身份配置
 .\.venv\Scripts\python.exe main.py --question "根据原始文档、Wiki 和知识图谱，说明项目负责人及依赖关系"
 ```
+
+简易演示前端（演示用，同一套 Agent 与 .env 配置）：
+
+```powershell
+Set-Location E:\GoLandCode\WeKnora-Agent
+.\.venv\Scripts\python.exe webapp.py
+# 打开 http://127.0.0.1:18100 （端口取 WEKNORA_AGENT_WEB_PORT，默认 18100）
+```
+
+页面把每轮问答的 MCP 工具调用轨迹（search_knowledge / read_document / wiki / query_knowledge_graph 等）和最终回答（含 chunk 级引用）实时展示出来。`webapp.py` 用 `.env` 里的 `WEKNORA_DEMO_EMAIL` / `WEKNORA_DEMO_PASSWORD` 自动向 WeKnora 登录换取新鲜 JWT（access token 24 小时过期，这里按需自动重登），其余凭据与 CLI 完全一致。
 
 模型必须支持工具调用及 OpenAI-compatible chat API。更换模型只需改 `AGENT_MODEL`、`AGENT_MODEL_BASE_URL`、`AGENT_MODEL_API_KEY`。
 
