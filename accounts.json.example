@@ -1,0 +1,10 @@
+{
+  "_comment": "MCP 验证控制台的本地账号档案。复制为 accounts.json 并填入真实凭据；accounts.json 已被 .gitignore 忽略，只存在于本机。密码仅用于向 WeKnora /api/v1/auth/login 换取短期 JWT，控制台服务端不缓存 token。",
+  "accounts": [
+    {
+      "name": "演示账号",
+      "email": "REPLACE_WITH_DEMO_EMAIL",
+      "password": "REPLACE_WITH_DEMO_PASSWORD"
+    }
+  ]
+}

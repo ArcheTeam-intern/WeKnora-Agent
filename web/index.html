@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WeKnora MCP 验证控制台</title>
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <div class="brand-mark">WK</div>
+    <div>
+      <div class="brand-title">MCP 验证控制台</div>
+      <div class="brand-sub">WeKnora-Agent</div>
+    </div>
+  </div>
+  <nav class="nav">
+    <a href="#/materials" data-route="materials" class="nav-item">
+      <span class="nav-ico">📄</span><span>资料与解析验证</span>
+    </a>
+    <a href="#/qa" data-route="qa" class="nav-item">
+      <span class="nav-ico">💬</span><span>问答</span>
+    </a>
+    <a href="#/bench" data-route="bench" class="nav-item">
+      <span class="nav-ico">🧰</span><span>MCP 工具台</span>
+    </a>
+  </nav>
+  <div class="sidebar-foot">
+    <div class="side-note">所有操作经 MCP 完成<br>共 <b id="tool-count">–</b> 个工具</div>
+    <button id="trace-toggle" class="btn ghost small">MCP 调用轨迹 <span id="trace-count" class="pill">0</span></button>
+  </div>
+</aside>
+
+<main class="main">
+  <header class="topbar">
+    <div class="tb-group">
+      <label class="tb-label">用户</label>
+      <select id="user-select" class="input select"></select>
+      <button id="login-btn" class="btn small">登录 / 切换</button>
+    </div>
+    <div class="tb-group">
+      <span id="endpoint-badge" class="badge info" title="MCP 端点（由 .env 固定）">端点加载中…</span>
+    </div>
+    <div class="tb-group tb-kbs">
+      <label class="tb-label">知识库</label>
+      <div id="kb-chips" class="chips"><span class="muted">登录后自动加载…</span></div>
+      <button id="kb-all" class="btn ghost small">全选</button>
+      <button id="kb-none" class="btn ghost small">清空</button>
+    </div>
+  </header>
+
+  <div class="content">
+    <section id="view-materials" class="view"></section>
+    <section id="view-qa" class="view"></section>
+    <section id="view-bench" class="view"></section>
+  </div>
+</main>
+
+<aside id="trace-drawer" class="drawer">
+  <div class="drawer-head">
+    <b>MCP 调用轨迹</b>
+    <div>
+      <button id="trace-clear" class="btn ghost small">清空</button>
+      <button id="trace-close" class="btn ghost small">关闭</button>
+    </div>
+  </div>
+  <div id="trace-list" class="trace-list"></div>
+</aside>
+
+<div id="modal-root" class="modal-root hidden">
+  <div class="modal-mask"></div>
+  <div id="modal-box" class="modal-box"></div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="/assets/app.js"></script>
+<script src="/assets/views.js"></script>
+</body>
+</html>

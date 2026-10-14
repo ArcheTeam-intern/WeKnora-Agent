@@ -6,3 +6,6 @@ mcp.local.json
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# 演示控制台的本地账号档案（含明文密码，仅本机使用）
+accounts.json
