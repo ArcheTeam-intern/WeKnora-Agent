@@ -43,6 +43,7 @@ function materialsMount(section) {
         <div class="row">
           <label class="field grow"><span>目标知识库（本次上传目标）</span>
             <select id="m-kb" class="input"></select></label>
+          <button id="m-kb-new" class="btn ghost small" title="经 MCP create_knowledge_base 新建">＋ 新建知识库</button>
           <label class="field"><span>上传通道</span>
             <div class="seg" id="m-channel">
               <button data-ch="tool" class="on">标准 MCP 工具</button>
@@ -238,6 +239,9 @@ function materialsMount(section) {
       pollDocStatus(section);
     };
 
+    // --- 新建知识库（建完自动刷新列表并选中）---
+    section.querySelector("#m-kb-new").onclick = () => openKbCreateDialog(section);
+
     // --- 刷新后找回：知识库最近导入的文档 ---
     section.querySelector("#m-recent").onclick = () => showRecentDocs(section);
 
@@ -246,6 +250,104 @@ function materialsMount(section) {
     syncKbSelect(section);
     syncEngineSelect(section);
     restoreLastImport(section);
+  }
+
+  /* ---- 新建知识库：控制台里就能开新库，不必再去 WeKnora 后台 ---- */
+
+  // openKbCreateDialog 打开建库弹窗（openModal 接收的是构建函数）。
+  function openKbCreateDialog(section) {
+    openModal(box => {
+      const h = document.createElement("h3");
+      h.textContent = "新建知识库";
+      box.appendChild(h);
+      const sub = document.createElement("div");
+      sub.className = "sub";
+      sub.textContent = "经 MCP create_knowledge_base 创建：语义检索与关键词检索默认开启，Wiki / 图谱按需勾选。";
+      box.appendChild(sub);
+
+      const mkField = (label, placeholder, id) => {
+        const lab = document.createElement("label");
+        lab.className = "field";
+        lab.innerHTML = `<span>${escapeHtml(label)}</span>`;
+        const input = document.createElement("input");
+        input.className = "input wide";
+        input.id = id;
+        input.placeholder = placeholder;
+        lab.appendChild(input);
+        box.appendChild(lab);
+        return input;
+      };
+      const nameInput = mkField("知识库名称（必填）", "例如：演示知识库", "kb-new-name");
+      const descInput = mkField("描述（可选）", "一句话说明这个库存什么", "kb-new-desc");
+
+      const mkToggle = (label, id) => {
+        const wrap = document.createElement("label");
+        wrap.className = "kv";
+        wrap.style.cssText = "display:flex;gap:6px;align-items:center";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.id = id;
+        wrap.appendChild(cb);
+        wrap.appendChild(document.createTextNode(" " + label));
+        box.appendChild(wrap);
+        return cb;
+      };
+      const wikiToggle = mkToggle("同时生成 Wiki 页面", "kb-new-wiki");
+      const graphToggle = mkToggle("同时抽取知识图谱", "kb-new-graph");
+
+      const actions = document.createElement("div");
+      actions.className = "modal-actions";
+      const cancel = document.createElement("button");
+      cancel.className = "btn ghost";
+      cancel.id = "kb-new-cancel";
+      cancel.textContent = "取消";
+      const ok = document.createElement("button");
+      ok.className = "btn";
+      ok.id = "kb-new-submit";
+      ok.textContent = "创建";
+      actions.append(cancel, ok);
+      box.appendChild(actions);
+
+      cancel.onclick = () => closeModal();
+      ok.onclick = async () => {
+        const name = nameInput.value.trim();
+        if (!name) { toast("请填写知识库名称", "err"); return; }
+        const epoch = captureIdentityEpoch();
+        ok.disabled = true;
+        ok.textContent = "创建中…";
+        const r = await api("/api/tool", {
+          method: "POST",
+          json: { name: "create_knowledge_base", arguments: {
+            name,
+            description: descInput.value.trim(),
+            enable_wiki: wikiToggle.checked,
+            enable_graph: graphToggle.checked,
+          } },
+          headers: mcpHeaders(), brief: "新建知识库",
+        });
+        if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+        ok.disabled = false;
+        ok.textContent = "创建";
+        const d = r.data || {};
+        if (!d.ok) {
+          toast("新建失败：" + (d.error || r.error || r.status), "err");
+          return;
+        }
+        const created = (d.result || {}).knowledge_base || {};
+        closeModal();
+        toast(`已创建知识库「${created.name || name}」`);
+        const scope = (d.result || {}).endpoint_scope;
+        if (scope && scope.added_to_endpoint_range === false) {
+          toast("新库还没加入当前端点范围：" + (scope.message || ""), "err");
+        }
+        // 刷新列表并把这个新库选为上传目标，省得再点一次。
+        await window.App.loadKbs();
+        if (created.id) { S.uploadTargetKbId = created.id; saveScope(); }
+        if (M.mounted) { syncKbSelect(section); syncEngineSelect(section); }
+        renderScopeSummary();
+      };
+      nameInput.focus();
+    });
   }
 
   // syncKbSelect 绑定「上传目标」单选框：它只影响资料页的请求范围。
@@ -587,8 +689,8 @@ function materialsMount(section) {
   }
 
   /* ===================== 视图二：问答 ===================== */
-// Q.scopeAll/qbIds/mode 由 app.js 的状态渲染；exec entry 单独是 LangChain。
-  const Q = { exec: "native", sessionId: "", busy: false, mounted: false };
+// Q.scopeAll/qbIds/mode 由 app.js 的状态渲染；问答只走 WeKnora 原生 ask。
+  const Q = { sessionId: "", busy: false, mounted: false };
 
   function qaScopeChips(section) {
     const box = section.querySelector("#qa-kbs");
@@ -679,12 +781,7 @@ function materialsMount(section) {
           <button id="qa-new" class="btn ghost small">新会话</button>
         </div>
         <div class="sub" id="qa-hint">模式经 MCP <span class="mono">ask</span> 的 mode 参数提交，由 WeKnora 校验生效；
-        「端点默认」使用端点配置的 agent。以下「LangChain 验证链」是独立入口，与原生模式二选一。</div>
-        <div class="row">
-          <label class="kv" style="display:flex;gap:6px;align-items:center">
-            <input type="checkbox" id="qa-langchain"> 使用 LangChain 验证链（独立开发验证入口，非 WeKnora 原生模式）
-          </label>
-        </div>
+        「端点默认」使用端点配置的 agent（本控制台只走 WeKnora 自己的问答链，不再内置其他编排框架）。</div>
       </div>
       <div id="qa-msgs"><div class="empty">还没有对话。选择范围后输入问题开始。</div></div>
       <div class="card">
@@ -702,11 +799,6 @@ function materialsMount(section) {
         setQaScopeChanged(section);
       };
     });
-    section.querySelector("#qa-langchain").onchange = e => {
-      Q.exec = e.target.checked ? "langchain" : "native";
-      section.querySelectorAll("#qa-mode button").forEach(b => { b.disabled = e.target.checked; });
-      setQaScopeChanged(section);
-    };
     section.querySelector("#qa-new").onclick = () => {
       Q.sessionId = "";
       section.querySelector("#qa-session").textContent = "–";
@@ -720,9 +812,7 @@ function materialsMount(section) {
     // 初始渲染：范围 chips、模式按钮、会话状态
     section.querySelectorAll("#qa-mode button").forEach(b => {
       b.classList.toggle("on", (b.dataset.mode || "") === (S.qaMode || ""));
-      b.disabled = Q.exec === "langchain";
     });
-    section.querySelector("#qa-langchain").checked = Q.exec === "langchain";
     qaScopeChips(section);
     renderQaScopeLine(section);
     updateQaSendState(section);
@@ -800,62 +890,38 @@ function materialsMount(section) {
     };
 
     try {
-      if (Q.exec === "native") {
-        const payload = { question, session_id: Q.sessionId || undefined };
-        if (S.qaMode) payload.mode = S.qaMode;
-        await sse("/api/ask", payload, evt => {
-          if (stale()) return;
-          if (evt.type === "status") statusEl.textContent = evt.text;
-          else if (evt.type === "answer") {
-            statusEl.remove();
-            const answer = stripThinking(evt.text);
-            const rendered = renderCitations(answer);
-            answerEl.innerHTML = renderMarkdown(rendered.text);
-            const meta = [];
-            if (evt.mode) meta.push(`模式 ${evt.mode}`);
-            if (Array.isArray(evt.knowledge_base_ids) && evt.knowledge_base_ids.length) {
-              meta.push(`范围 ${evt.knowledge_base_ids.length} 库`);
-            }
-            if (meta.length) {
-              const badge = document.createElement("div");
-              badge.className = "kv";
-              badge.textContent = meta.join(" · ");
-              refsEl.appendChild(badge);
-            }
-            if (evt.session_id) {
-              Q.sessionId = evt.session_id;
-              section.querySelector("#qa-session").textContent = evt.session_id.slice(0, 12) + "…";
-            }
-            attachmentsForRefs(refsEl, evt.references || [], rendered);
-          } else if (evt.type === "error") {
-            statusEl.textContent = evt.message || "调用失败";
-            statusEl.classList.add("err");
+      // 只用 WeKnora 自己的问答链：原生 ask（mode 经 MCP 参数提交）。
+      const payload = { question, session_id: Q.sessionId || undefined };
+      if (S.qaMode) payload.mode = S.qaMode;
+      await sse("/api/ask", payload, evt => {
+        if (stale()) return;
+        if (evt.type === "status") statusEl.textContent = evt.text;
+        else if (evt.type === "answer") {
+          statusEl.remove();
+          const answer = stripThinking(evt.text);
+          const rendered = renderCitations(answer);
+          answerEl.innerHTML = renderMarkdown(rendered.text);
+          const meta = [];
+          if (evt.mode) meta.push(`模式 ${evt.mode}`);
+          if (Array.isArray(evt.knowledge_base_ids) && evt.knowledge_base_ids.length) {
+            meta.push(`范围 ${evt.knowledge_base_ids.length} 库`);
           }
-        }, window.App.qaHeaders());
-      } else {
-        await sse("/api/chat", { question }, evt => {
-          if (stale()) return;
-          if (evt.type === "status") statusEl.textContent = evt.text;
-          else if (evt.type === "tool") {
-            statusEl.remove();
-            const chip = document.createElement("div");
-            chip.className = "tool-chip";
-            chip.innerHTML = `<b>🔧 ${escapeHtml(evt.name)}</b> ${escapeHtml(evt.args || "")}`;
-            toolsEl.appendChild(chip);
-          } else if (evt.type === "tool_result" && evt.status === "error") {
-            const last = [...toolsEl.children].reverse()[0];
-            if (last) last.classList.add("err");
-          } else if (evt.type === "answer") {
-            if (statusEl.parentNode) statusEl.remove();
-            const rendered = renderCitations(stripThinking(evt.text));
-            answerEl.innerHTML = renderMarkdown(rendered.text);
-            attachmentsForRefs(refsEl, [], rendered);
-          } else if (evt.type === "error") {
-            statusEl.textContent = evt.message || "运行失败";
-            statusEl.classList.add("err");
+          if (meta.length) {
+            const badge = document.createElement("div");
+            badge.className = "kv";
+            badge.textContent = meta.join(" · ");
+            refsEl.appendChild(badge);
           }
-        }, window.App.qaHeaders());
-      }
+          if (evt.session_id) {
+            Q.sessionId = evt.session_id;
+            section.querySelector("#qa-session").textContent = evt.session_id.slice(0, 12) + "…";
+          }
+          attachmentsForRefs(refsEl, evt.references || [], rendered);
+        } else if (evt.type === "error") {
+          statusEl.textContent = evt.message || "调用失败";
+          statusEl.classList.add("err");
+        }
+      }, window.App.qaHeaders());
     } catch (e) {
       if (!stale()) {
         statusEl.textContent = "连接失败：" + e.message;
@@ -948,38 +1014,10 @@ function materialsMount(section) {
           <button id="m-download" class="btn ghost" disabled>下载清单 JSON</button>
         </div>
         <div id="m-checklist"><div class="empty">在资料页完成一次导入后自动运行；也可在此直接验证已有文档。</div></div>
-      </div>
-      <div class="card">
-        <h3>写工具：新建 / 更新 / 删除文档</h3>
-        <div class="sub">对应 MCP 的 <span class="mono">add_document</span> / <span class="mono">update_document</span> / <span class="mono">delete_document</span>：
-        新建支持 Markdown 文本；更新与删除只对 Markdown 文档生效。删除需要输入文档标题确认，且不可撤销。</div>
-        <div class="row">
-          <label class="field"><span>操作</span>
-            <select id="m-op" class="input select">
-              <option value="add_document">新建文档（add_document）</option>
-              <option value="update_document">更新文档（update_document）</option>
-              <option value="delete_document">删除文档（delete_document）</option>
-            </select></label>
-          <label class="field grow"><span>文档 ID（更新 / 删除必填）</span>
-            <input id="m-op-id" class="input mono" autocomplete="off"></label>
-        </div>
-        <div class="row"><label class="field grow"><span>标题（新建必填；更新留空则保留原标题）</span>
-          <input id="m-op-title" class="input"></label></div>
-        <div class="row"><label class="field grow"><span>Markdown 内容（新建 / 更新必填）</span>
-          <textarea id="m-op-content" class="input" rows="4"></textarea></label></div>
-        <div class="row"><button id="m-op-run" class="btn">执行</button>
-          <span id="m-op-status" class="status-line"></span></div>
-        <div id="m-op-result"></div>
       </div>`;
     section.querySelector("#b-filter").oninput = e => renderToolList(section, e.target.value.trim().toLowerCase());
     section.querySelector("#m-run-checklist").onclick = () => runChecklist(section);
     section.querySelector("#m-download").onclick = () => downloadChecklist(section);
-    section.querySelector("#m-op").onchange = () => {
-      const op = section.querySelector("#m-op").value;
-      section.querySelector("#m-op-content").closest(".row").classList.toggle("hidden", op === "delete_document");
-      section.querySelector("#m-op-title").closest(".row").classList.toggle("hidden", op === "delete_document");
-    };
-    section.querySelector("#m-op-run").onclick = () => runWriteTool(section);
     B.mounted = true;
     renderToolList(section, "");
   }
@@ -1000,64 +1038,6 @@ function materialsMount(section) {
     a.download = `mcp-checklist-${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
-  }
-
-  // runWriteTool 执行 add/update/delete_document（诊断用，带二次确认）。
-  async function runWriteTool(section) {
-    const epoch = captureIdentityEpoch();
-    const st = section.querySelector("#m-op-status");
-    const op = section.querySelector("#m-op").value;
-    const kb = S.uploadTargetKbId;
-    const id = section.querySelector("#m-op-id").value.trim();
-    const title = section.querySelector("#m-op-title").value.trim();
-    const content = section.querySelector("#m-op-content").value;
-    let args;
-    if (op === "add_document") {
-      if (!kb || !title || !content) { st.textContent = "新建需要：标题和内容；目标知识库请在「资料解析」页选择"; st.classList.add("err"); return; }
-      args = { knowledge_base_id: kb, title, content };
-    } else if (op === "update_document") {
-      if (!id || !content) { st.textContent = "更新需要：文档 ID 和新的 Markdown 内容"; st.classList.add("err"); return; }
-      args = { knowledge_id: id, content };
-      if (title) args.title = title;
-    } else {
-      if (!id) { st.textContent = "删除需要：文档 ID"; st.classList.add("err"); return; }
-      const okGo = await confirmDialog({
-        title: "删除文档", danger: true, confirmText: "永久删除", typed: title || undefined,
-        message: `将通过 MCP delete_document 删除：
-${id}
-${title ? "（输入标题以确认）" : "该操作不可撤销。"}`,
-      });
-      if (!okGo) return;
-      args = { knowledge_id: id };
-    }
-    if (op !== "delete_document") {
-      const [opCN] = toolCN(op);
-      const okGo = await confirmDialog({
-        title: `执行「${opCN}」`, message: `将经 MCP 调用 ${op}：
-${JSON.stringify(args, null, 2).slice(0, 600)}`,
-      });
-      if (!okGo) return;
-    }
-    st.classList.remove("err");
-    st.textContent = "执行中…";
-    const r = await api("/api/tool", {
-      method: "POST", json: { name: op, arguments: args },
-      headers: materialsHeaders(), brief: op,
-    });
-    if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
-    const d = r.data || {};
-    st.textContent = d.ok ? `成功（${d.latency_ms}ms）` : `失败：${d.error || r.error || r.status}`;
-    if (!d.ok) st.classList.add("err");
-    const box = section.querySelector("#m-op-result");
-    box.innerHTML = "";
-    const pre = document.createElement("pre");
-    pre.className = "raw small";
-    pre.textContent = JSON.stringify(d, null, 2);
-    box.appendChild(pre);
-    if (d.ok && op === "add_document") {
-      const newId = ((d.result || {}).document || {}).id || "";
-      if (newId) section.querySelector("#m-op-id").value = newId;
-    }
   }
 
   function renderToolList(section, filter) {
@@ -1101,6 +1081,10 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
       <div class="sub">${escapeHtml(desc || "（暂无中文说明）")}</div>
       <details class="token-help"><summary>接口原始描述（MCP 契约，英文）</summary>
         <p>${escapeHtml(t.description || "（无描述）")}</p></details>
+      <div class="row" style="align-items:center">
+        <button id="b-example" class="btn ghost small">填入示例</button>
+        <span id="b-example-note" class="kv">示例会用当前知识库的真实 id 填好参数，直接点「运行」就能看到结果。</span>
+      </div>
       <div class="row">
         <div class="seg" id="b-mode"><button data-m="form" class="on">表单</button><button data-m="json">JSON 编辑</button></div>
         <span class="grow"></span>
@@ -1124,6 +1108,7 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
         else buildForm(box.querySelector("#b-form"), t.inputSchema || {});
       };
     });
+    box.querySelector("#b-example").onclick = () => fillToolExample(section, box);
     box.querySelector("#b-run").onclick = () => runBenchTool(section, box);
   }
 
@@ -1187,6 +1172,187 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
       }
     }
     return args;
+  }
+
+  /* ---- 每个工具的「能真跑出结果」示例 ---- */
+
+  // TOOL_EXAMPLE_NOTE 说明点「填入示例」后跑出来的是什么，方便演示时讲。
+  const TOOL_EXAMPLE_NOTE = {
+    list_knowledge_bases: "当前身份可见的知识库，以及每个库开启了哪些能力。",
+    create_knowledge_base: "新建一个知识库（默认开语义 + 关键词，可勾选 Wiki / 图谱），返回它的 id。",
+    list_parser_engines: "本部署真实可用的解析引擎，以及各自支持的文件类型。",
+    list_documents: "目标知识库里最近的文档（含解析状态）。",
+    get_document_status: "某篇文档的解析/索引进度，以及请求与实际使用的解析引擎。",
+    read_document: "某篇文档解析出来的正文（示例取第 1 段）。",
+    search_knowledge: "语义+关键词检索的命中分块与来源文档。",
+    grep_chunks: "在分块里做字面匹配的结果，适合核对编号、金额。",
+    ask: "一次原生问答，返回带引用的回答。",
+    get_knowledge_base_status: "知识库规模与能力可用性（文档数、分块数、Wiki/图谱是否就绪）。",
+    get_upload_status: "某个 upload_id 的暂存状态。",
+    upload_file: "把一段 Markdown 文本作为文件暂存，返回 upload_id。",
+    import_document_file: "把暂存的文件变成正式文档并触发解析。",
+    add_document: "新建一篇 Markdown 文档（会真的写进知识库）。",
+    update_document: "替换某篇文档的正文，随后重新索引。",
+    delete_document: "删除文档及其索引（不可撤销，示例指向演示文档）。",
+    wiki_index: "Wiki 的分组与页面清单。",
+    wiki_list_pages: "按类型/状态分页列出 Wiki 页面。",
+    wiki_read_page: "单个 Wiki 页面的正文与引用。",
+    wiki_search: "在 Wiki 页面里检索。",
+    wiki_graph: "Wiki 页面之间的关系边。",
+    query_knowledge_graph: "知识图谱的实体/关系（该库没开启图谱时返回空）。",
+  };
+
+  // EX 缓存示例用到的真实 id，避免每次点「填入示例」都重查一遍。
+  const EX = { kbId: "", docId: "", docTitle: "", docWord: "" };
+
+  function exampleKbId() {
+    return S.uploadTargetKbId || (S.kbs[0] && S.kbs[0].id) || "";
+  }
+
+  async function exampleNewestDoc(kbId) {
+    if (EX.kbId === kbId && EX.docId) return EX;
+    const r = await api("/api/tool", {
+      method: "POST", json: { name: "list_documents", arguments: { knowledge_base_id: kbId, page_size: 5 } },
+      headers: materialsHeaders(), brief: "取示例文档",
+    });
+    const docs = ((r.data && r.data.result) || {}).documents || [];
+    const picked = docs.find(d => d.parse_status === "completed") || docs[0];
+    if (picked) {
+      EX.kbId = kbId;
+      EX.docId = picked.id;
+      EX.docTitle = picked.title || picked.file_name || "";
+      // 用标题里的一个词做检索示例，比固定词更容易命中。
+      const word = String(EX.docTitle).replace(/\.[a-z]+$/i, "").slice(0, 6);
+      EX.docWord = word || "验收";
+    }
+    return EX;
+  }
+
+  function examplePlainText() {
+    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+    return "# 控制台演示文档\n\n这是 " + stamp + " 由控制台通过 MCP add_document 创建的演示内容。\n";
+  }
+
+  // resolveToolExample 返回 { args, note }：参数全部来自当前真实状态。
+  async function resolveToolExample(name) {
+    const kbId = exampleKbId();
+    const kbArgs = { knowledge_base_id: kbId };
+    const kbList = { knowledge_base_ids: kbId ? [kbId] : [] };
+    switch (name) {
+      case "list_knowledge_bases":
+      case "list_parser_engines":
+        return { args: {} };
+      case "create_knowledge_base":
+        return { args: { name: "演示知识库-" + new Date().toISOString().slice(0, 10),
+                         description: "由控制台通过 MCP 创建", enable_wiki: false, enable_graph: false },
+                 note: "创建成功后新的库会自动加入本端点范围，可以在「资料解析」页直接用它上传。" };
+      case "list_documents":
+        return { args: Object.assign({ page_size: 5 }, kbArgs) };
+      case "get_knowledge_base_status":
+        return { args: Object.assign({}, kbArgs) };
+      case "get_document_status":
+      case "read_document": {
+        await exampleNewestDoc(kbId);
+        if (!EX.docId) throw new Error("目标知识库里还没有文档，先上传一份");
+        const args = { knowledge_id: EX.docId };
+        if (name === "read_document") args.limit = 1;
+        return { args, note: "用的是《" + (EX.docTitle || EX.docId) + "》" };
+      }
+      case "search_knowledge":
+        await exampleNewestDoc(kbId);
+        return { args: Object.assign({ query: EX.docWord || "验收", limit: 5 }, kbList),
+                 note: "检索词「" + (EX.docWord || "验收") + "」取自最近文档的标题" };
+      case "grep_chunks":
+        await exampleNewestDoc(kbId);
+        return { args: Object.assign({ query: EX.docWord || "验收", limit: 5 }, kbList) };
+      case "ask":
+        return { args: { question: "这个知识库里有哪些资料？请按文档分别说明。", mode: "quick-answer" } };
+      case "wiki_index":
+        return { args: Object.assign({ limit: 20 }, kbArgs) };
+      case "wiki_list_pages":
+        return { args: Object.assign({ page: 1, page_size: 5 }, kbArgs) };
+      case "wiki_read_page":
+        return { args: { slug: "index", knowledge_base_id: kbId },
+                 note: "「index」是每套 Wiki 的入口页；要读别的页面可以先跑 wiki_index 拿 slug" };
+      case "wiki_search":
+        await exampleNewestDoc(kbId);
+        return { args: Object.assign({ query: EX.docWord || "总结", limit: 5 }, kbList) };
+      case "wiki_graph":
+        return { args: Object.assign({ limit: 10 }, kbArgs) };
+      case "query_knowledge_graph":
+        await exampleNewestDoc(kbId);
+        return { args: Object.assign({ query: EX.docWord || "项目" }, kbList),
+                 note: "知识库没开启图谱抽取时，这里会返回空列表（属正常，不是错误）" };
+      case "upload_file":
+        return { args: { knowledge_base_id: kbId, file_name: "console-demo-" + Date.now() + ".md",
+                         content: exampleBase64() },
+                 note: "示例把一段 Markdown 文本当作文件上传；返回的 upload_id 可以接着跑 import_document_file" };
+      case "import_document_file": {
+        const uploadId = (M.receipt && M.receipt.upload_id) || "";
+        if (!uploadId) throw new Error("先在「资料解析」页上传一次，示例会复用那次 upload_id");
+        return { args: { knowledge_base_id: kbId, upload_id: uploadId } };
+      }
+      case "get_upload_status": {
+        const uploadId = (M.receipt && M.receipt.upload_id) || "";
+        if (!uploadId) throw new Error("先上传一次，示例会复用那次 upload_id");
+        return { args: { upload_id: uploadId } };
+      }
+      case "add_document":
+        return { args: { knowledge_base_id: kbId, title: "控制台演示文档 " + new Date().toLocaleTimeString(),
+                         content: examplePlainText() } };
+      case "update_document": {
+        await exampleNewestDoc(kbId);
+        if (!EX.docId) throw new Error("目标知识库里还没有文档");
+        return { args: { knowledge_id: EX.docId, content: examplePlainText() + "\n（由控制台更新）\n" },
+                 note: "会覆盖《" + (EX.docTitle || EX.docId) + "》的正文，仅对 Markdown 文档有效" };
+      }
+      case "delete_document": {
+        await exampleNewestDoc(kbId);
+        if (!EX.docId) throw new Error("目标知识库里还没有文档");
+        return { args: { knowledge_id: EX.docId },
+                 note: "⚠️ 会把《" + (EX.docTitle || EX.docId) + "》删掉且不可撤销；演示前建议先用 add_document 建一篇草稿" };
+      }
+      default:
+        return { args: {} };
+    }
+  }
+
+  // exampleBase64 把演示文本编码成 upload_file 需要的 base64（UTF-8 安全）。
+  function exampleBase64() {
+    const text = examplePlainText();
+    return btoa(unescape(encodeURIComponent(text)));
+  }
+
+  async function fillToolExample(section, box) {
+    const note = box.querySelector("#b-example-note");
+    const t = B.tool;
+    if (!t) return;
+    note.classList.remove("err");
+    note.textContent = "正在准备示例参数…";
+    let resolved;
+    try {
+      resolved = await resolveToolExample(t.name);
+    } catch (e) {
+      note.classList.add("err");
+      note.textContent = e.message;
+      return;
+    }
+    const args = resolved.args || {};
+    if (B.formMode === "json") {
+      box.querySelector("#b-json-text").value = JSON.stringify(args, null, 2);
+    } else {
+      for (const [name, entry] of Object.entries(B.formInputs)) {
+        const el = entry.el, spec = entry.spec;
+        if (!(name in args)) { el.checked = false; el.value = ""; continue; }
+        const v = args[name];
+        if (spec.type === "boolean") el.checked = !!v;
+        else if (spec.type === "array") el.value = Array.isArray(v) ? v.join("\n") : String(v);
+        else if (spec.type === "object") el.value = JSON.stringify(v, null, 2);
+        else el.value = v == null ? "" : String(v);
+      }
+    }
+    note.textContent = (resolved.note ? resolved.note + " " : "") +
+      (TOOL_EXAMPLE_NOTE[t.name] || "示例参数已按当前真实数据填好");
   }
 
   async function runBenchTool(section, box) {

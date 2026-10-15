@@ -206,7 +206,6 @@ const PATH_CN = {
   "/api/tool": "调用 MCP 工具",
   "/api/checklist": "运行验证清单",
   "/api/ask": "知识问答（原生模式）",
-  "/api/chat": "知识问答（LangChain Agent）",
   "/api/local-credential": "读取本机凭证",
 };
 function toolCN(name) { return TOOL_CN[name] || [String(name || ""), ""]; }

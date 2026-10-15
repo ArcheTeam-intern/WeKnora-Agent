@@ -411,7 +411,47 @@ test("a finished parse shows the chunk preview in the progress panel", async () 
   assert.ok(/林澈/.test(panel), "应显示解析出的原文预览");
 });
 
-/* ---------------- 8. KB/工具刷新：迟到列表不得写回 ---------------- */
+/* ---------------- 8. 工具示例：用真实 id 填参数 ---------------- */
+test("a tool example fills real ids from the live workspace", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-bench");
+  w.App.S.ui.view = "bench";
+  setIdentity(w, "a@example.com", "token-a");
+  w.App.S.kbs = [{ id: "kb-1", name: "验收库", type: "document", capability_flags: {} }];
+  w.App.S.uploadTargetKbId = "kb-1";
+  w.App.S.tools = [{
+    name: "get_document_status", description: "d", destructive: false,
+    inputSchema: { type: "object", required: ["knowledge_id"],
+                   properties: { knowledge_id: { type: "string", description: "Document id" } } },
+  }];
+  w.Views.show("bench", section);
+  const item = section.querySelector("#b-list").children.find(c => String(c.className).includes("tool-item"));
+  item.onclick();
+  await flush();
+
+  const detail = section.querySelector("#b-detail");
+  detail.querySelector("#b-example").onclick();
+  await flush();
+  // 示例先解析出「最近一篇文档」，再把它填进 knowledge_id。
+  const lookup = takeCall("/api/tool");
+  const lookupBody = JSON.parse(lookup.opts.body);
+  assert.equal(lookupBody.name, "list_documents");
+  assert.equal(lookupBody.arguments.knowledge_base_id, "kb-1");
+  lookup.resolve(jsonResp(200, { ok: true, result: { documents: [
+    { id: "doc-42", title: "青岚计划.pdf", parse_status: "completed" },
+    { id: "doc-41", title: "旧文档.md", parse_status: "completed" },
+  ] } }));
+  await flush();
+
+  assert.equal(w.App.S.tools.length, 1);
+  const filled = detail.querySelector("#b-form");
+  const input = filled.children.find(c => String(c.tagName) === "label");
+  assert.ok(input, "表单应渲染出字段");
+  assert.equal(input.children[0].value, "doc-42", "示例应填入真实文档 id");
+  assert.ok(/青岚计划/.test(detail.querySelector("#b-example-note").textContent), "示例说明应指出用的是哪篇文档");
+});
+
+/* ---------------- 9. KB/工具刷新：迟到列表不得写回 ---------------- */
 test("a late knowledge-base list from A never repopulates B's state", async () => {
   const w = boot();
   setIdentity(w, "a@example.com", "token-a");

@@ -47,9 +47,9 @@ powershell -ExecutionPolicy Bypass -File scripts\refresh-credential.ps1   # 一�
 
 控制台有三个视图，全部操作经 MCP 完成，右上角「MCP 调用轨迹」抽屉保留每次请求的原始 JSON：
 
-- **资料解析**：**上传目标知识库**与**解析引擎**各自独立选择（引擎来自 `list_parser_engines` 的真实目录，不可用的引擎带原因且不可选；「使用知识库默认」即不指定）。上传双通道可切换（`upload_file` 工具 base64 通道，或 multipart `/mcp/:id/uploads` 原样透传）→ `import_document_file` 携带 `process_config` 导入 → 状态行显示「解析/索引/请求引擎/实际引擎」，即 `applied_parser_engine` 与请求的规则对照。
-- **知识问答**：**问答范围**多选知识库（或「全部可用」；未选择时发送按钮禁用）与上传目标互不干扰；**问答模式**可选原生 `ask` 的 `quick-answer` / `smart-reasoning`，或切到 LangChain Agent 模式（模型自主编排只读工具，展示工具轨迹）。切换范围或模式会开启新会话并丢弃旧范围/旧模式在途的回答；同一会话内可带 `session_id` 续问。
-- **开发诊断**：`tools/list` 全量工具（按 inputSchema 自动生成参数表单，可切 JSON 编辑）、原始请求/响应面板、破坏性工具二次确认；验证清单（状态轮询 → `read_document` → `list_documents` → 检索 → `wiki_*` → 图谱 → `get_knowledge_base_status`，按 `capability_flags` 两级门控跳过并注明原因，可下载 JSON）；add/update/delete_document 写工具入口。
+- **资料解析**：可直接「＋ 新建知识库」（经 MCP `create_knowledge_base`，建完自动刷新并选中；受限端点会把新库加入自己的范围）；**上传目标知识库**与**解析引擎**各自独立选择（引擎来自 `list_parser_engines` 的真实目录，不可用的引擎带原因且不可选；「使用知识库默认」即不指定）。上传双通道可切换（`upload_file` 工具 base64 通道，或 multipart `/mcp/:id/uploads` 原样透传）→ `import_document_file` 携带 `process_config` 导入 → 状态行显示「解析/索引/请求引擎/实际引擎」，即 `applied_parser_engine` 与请求的规则对照。
+- **知识问答**：**问答范围**多选知识库（或「全部可用」；未选择时发送按钮禁用）与上传目标互不干扰；**问答模式**用 WeKnora 原生 `ask` 的 `quick-answer` / `smart-reasoning`（模式经 MCP 参数提交，由服务端校验并回显）。切换范围或模式会开启新会话并丢弃旧范围/旧模式在途的回答；同一会话内可带 `session_id` 续问。控制台本身不含任何第三方编排框架——它验证的是主产品将来直接消费的 MCP 表面。
+- **开发诊断**：`tools/list` 全量工具（按 inputSchema 自动生成参数表单，可切 JSON 编辑）、原始请求/响应面板、破坏性工具二次确认；每个工具都有「填入示例」——参数用当前知识库的真实 id 填好（最近文档、最近上传），点运行即可看到真实结果；验证清单（状态轮询 → `read_document` → `list_documents` → 检索 → `wiki_*` → 图谱 → `get_knowledge_base_status`，按 `capability_flags` 两级门控跳过并注明原因，可下载 JSON）。写工具就在工具目录里，运行时二次确认。
 
 凭证由 WeKnora 验证目录里的独立工具 `issue_user_token.py` 正式签发（access token 24 小时过期）；`scripts/refresh-credential.ps1` 只是它的本机便捷入口，签发后会把新 JWT 同步进 `.env` 供 CLI 使用，并把凭证文件留在标准位置供工作台一键读取（`GET /api/local-credential` 只在显式设置 `WEKNORA_CREDENTIAL_FILE` 且请求来自本机时读取）。工作台自身不做登录、不保存密码、不自动续期；知识库范围是可选的收窄（与 MCP 契约一致：不选=不收窄），顶栏显示当前身份、端点名称/模式/工具数与范围摘要（只读）。
 
