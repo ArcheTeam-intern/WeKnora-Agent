@@ -285,6 +285,9 @@ test("a late bench tool result never rewrites B's status line", async () => {
   detail.querySelector("#b-run").onclick();
   await flush();
   const toolCall = takeCall("/api/tool");
+  // 状态行此刻写着「运行中…（中文工具名）」；用实际值做基准，断言迟到的
+  // 结果一个字符都不改它。
+  const statusBefore = detail.querySelector("#b-status").textContent;
 
   setIdentity(w, "b@example.com", "token-b");
   w.App.setActiveProfile("b@example.com");
@@ -292,11 +295,59 @@ test("a late bench tool result never rewrites B's status line", async () => {
 
   toolCall.resolve(jsonResp(200, { ok: true, latency_ms: 4, result: { knowledge_bases: [] } }));
   await flush();
-  assert.equal(detail.querySelector("#b-status").textContent, "运行中…", "迟到结果不得改写状态行");
+  assert.equal(detail.querySelector("#b-status").textContent, statusBefore, "迟到结果不得改写状态行");
   assert.equal(detail.querySelector("#b-result").children.length, 0, "迟到结果不得渲染响应面板");
 });
 
-/* ---------------- 6. KB/工具刷新：迟到列表不得写回 ---------------- */
+/* ---------------- 6. 上传标识：换文件自动换 key + 冲突自动重试 ---------------- */
+test("uploading a second file never reuses the previous idempotency key", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-materials");
+  w.Views.show("materials", section);
+  setIdentity(w, "a@example.com", "token-a");
+  const fileInput = section.querySelector("#m-file");
+  const idem = section.querySelector("#m-idem");
+
+  fileInput.files = [new File([new Uint8Array([1])], "first.pdf", { type: "application/pdf" })];
+  fileInput.onchange();
+  const key1 = idem.value;
+  assert.ok(key1, "首次选择文件后应有上传标识");
+
+  fileInput.files = [new File([new Uint8Array([2])], "second.pdf", { type: "application/pdf" })];
+  fileInput.onchange();
+  assert.notEqual(idem.value, key1, "换文件必须换新标识，否则服务端按幂等契约拒绝第二份文件");
+});
+
+test("an idempotency conflict is retried once with a fresh key", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-materials");
+  w.Views.show("materials", section);
+  setIdentity(w, "a@example.com", "token-a");
+  section.querySelector("#m-kb").value = "kb-1";
+  const fileInput = section.querySelector("#m-file");
+  fileInput.files = [new File([new Uint8Array([3])], "third.pdf", { type: "application/pdf" })];
+  fileInput.onchange();
+
+  const st = section.querySelector("#m-upload-status");
+  section.querySelector("#m-upload").onclick();
+  await flush();
+  const first = takeCall("/api/upload");
+  const key1 = first.opts.headers["Idempotency-Key"];
+  assert.ok(key1, "上传请求必须带 Idempotency-Key");
+
+  // 服务端按幂等契约拒绝：同一标识配了不同字节。
+  first.resolve(jsonResp(200, { ok: false, error: "this Idempotency-Key was already used for a different file or knowledge base", error_code: "IDEMPOTENCY_CONFLICT" }));
+  await flush();
+  const second = takeCall("/api/upload");
+  const key2 = second.opts.headers["Idempotency-Key"];
+  assert.notEqual(key2, key1, "冲突后必须用新标识重试");
+  second.resolve(jsonResp(200, { ok: true, result: { upload_id: "u-1", file_name: "third.pdf" } }));
+  await flush();
+  assert.equal(st.textContent, "上传成功");
+  assert.equal(section.querySelector("#m-import").disabled, false, "重试成功后导入按钮应可用");
+});
+
+/* ---------------- 7. KB/工具刷新：迟到列表不得写回 ---------------- */
 test("a late knowledge-base list from A never repopulates B's state", async () => {
   const w = boot();
   setIdentity(w, "a@example.com", "token-a");

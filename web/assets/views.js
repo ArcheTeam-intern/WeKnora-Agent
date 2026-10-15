@@ -3,12 +3,12 @@
 
 (function () {
   const { S, api, sse, toast, confirmDialog, renderMarkdown, escapeHtml, mcpHeaders,
-          captureIdentityEpoch, isCurrentIdentityEpoch } = window.App;
+          captureIdentityEpoch, isCurrentIdentityEpoch, toolCN, fieldCN, statusCN } = window.App;
 
   /* ===================== 视图一：资料与解析验证 ===================== */
   const M = {
     file: null, channel: "tool", receipt: null, doc: null,
-    steps: [], summary: null, mounted: false,
+    steps: [], summary: null, mounted: false, idemAuto: true,
   };
 
   function uuid4() {
@@ -17,6 +17,22 @@
       const r = Math.random() * 16 | 0;
       return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
     });
+  }
+
+  // isIdempotencyConflict 识别服务端的「上传标识已用于别的文件/知识库」拒绝，
+  // 两条上传通道的错误形状不同（工具通道给 error_code，文件流通道给上游文本）。
+  function isIdempotencyConflict(d, r) {
+    const code = String((d && d.error_code) || "").toUpperCase();
+    const text = JSON.stringify([(d && (d.error || d.detail)) || "", r.error || ""]);
+    return code.includes("IDEMPOTENCY") || /Idempotency-Key was already used/i.test(text);
+  }
+
+  // uploadErrorText 把两条通道的错误整理成一句人能读的话。
+  function uploadErrorText(d, r) {
+    const err = d && (d.error || d.detail);
+    if (err && typeof err === "object") return err.message || JSON.stringify(err);
+    if (typeof err === "string" && err) return err;
+    return r.error || String(r.status || "未知错误");
   }
 
 function materialsMount(section) {
@@ -47,10 +63,12 @@ function materialsMount(section) {
           <span id="m-upload-status" class="status-line"></span>
         </div>
         <div id="m-receipt"></div>
-        <details class="token-help"><summary>高级：上传请求标识（同 key 同字节幂等重放）</summary>
+        <details class="token-help"><summary>高级：上传请求标识（不理解就别改）</summary>
+          <div class="sub" style="margin-top:6px">同一份文件用同一个标识重传 = 幂等重放，不会重复入库；换文件或换知识库时页面会自动换新标识。
+          只有在脚本里对接服务端时才需要手填。</div>
           <div class="row" style="margin-top:8px">
             <input id="m-idem" class="input mono grow" autocomplete="off">
-            <button id="m-idem-gen" class="btn ghost small">生成</button>
+            <button id="m-idem-gen" class="btn ghost small">生成新的</button>
           </div>
         </details>
       </div>
@@ -90,16 +108,21 @@ function materialsMount(section) {
       S.uploadTargetKbId = e.target.value;
       saveScope();
       renderScopeSummary();
+      // 标识按「文件 + 目标库」区分：换库后沿用旧标识会被服务端判为冲突。
+      if (M.idemAuto) newIdem(section);
     };
 
     // --- 文件选择 / 拖拽 ---
     const drop = section.querySelector("#m-drop");
     const fileInput = section.querySelector("#m-file");
     const setName = f => {
+      const prevName = M.file && M.file.name;
       M.file = f || null;
       const nameEl = section.querySelector("#m-file-name");
       if (f) { nameEl.textContent = `${f.name} · ${(f.size / 1024).toFixed(1)} KB`; nameEl.classList.remove("hidden"); }
       else { nameEl.classList.add("hidden"); }
+      // 换文件必须换标识：同一标识配不同字节会被服务端拒绝（幂等契约）。
+      if (f && f.name !== prevName && M.idemAuto) newIdem(section);
     };
     drop.onclick = () => fileInput.click();
     fileInput.onchange = () => setName(fileInput.files[0]);
@@ -109,10 +132,15 @@ function materialsMount(section) {
       e.preventDefault(); drop.classList.remove("dragover");
       if (e.dataTransfer.files.length) setName(e.dataTransfer.files[0]);
     });
-    section.querySelector("#m-idem").value = uuid4();
-    section.querySelector("#m-idem-gen").onclick = () => {
-      section.querySelector("#m-idem").value = uuid4();
-    };
+    // newIdem 生成新标识；用户一旦手改过输入框，就不再自动覆盖。
+    function newIdem(sec) {
+      const input = sec.querySelector("#m-idem");
+      if (input) input.value = uuid4();
+      M.idemAuto = true;
+    }
+    section.querySelector("#m-idem").addEventListener("input", () => { M.idemAuto = false; });
+    newIdem(section);
+    section.querySelector("#m-idem-gen").onclick = () => newIdem(section);
 
     // --- 解析引擎选择 ---
     section.querySelector("#m-engine").onchange = e => {
@@ -129,35 +157,46 @@ function materialsMount(section) {
       if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
       if (!kb) { st.textContent = "请选择目标知识库"; st.classList.add("err"); return; }
       if (!M.file) { st.textContent = "请选择文件"; st.classList.add("err"); return; }
-      const idem = section.querySelector("#m-idem").value.trim();
       st.classList.remove("err");
-      st.textContent = `上传中（${M.channel}）…`;
-      const fd = new FormData();
-      // 字段顺序即契约：knowledge_base_id 必须排在 file 之前。
-      fd.append("knowledge_base_id", kb);
-      fd.append("file", M.file, M.file.name);
-      const path = `/api/upload?channel=${encodeURIComponent(M.channel)}`;
-      const headers = Object.assign(materialsHeaders(), idem ? { "Idempotency-Key": idem } : {});
-      const r = await api(path, {
-        method: "POST", body: fd, headers,
-        brief: `上传 ${M.file.name}`,
-      });
-      // 旧身份的上传回执不得写进新身份的面板。
-      if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
-      const d = r.data || {};
-      // 两条通道的回执形状：multipart={success,data:{...}}；tool={ok,result:{...}}
-      const receipt = d.data || d.result || null;
-      if (!r.ok || !receipt || !(receipt.upload_id || (receipt.receipt && receipt.receipt.upload_id))) {
-        st.textContent = "上传失败：" + (d.error ? (d.error.message || JSON.stringify(d.error)) : (r.error || r.status));
+      const channelCN = M.channel === "tool" ? "标准 MCP 工具" : "文件流";
+      // 最多两次：上传标识冲突时自动换一个新的标识重试一次（同一标识配不同
+      // 字节/知识库会被服务端按幂等契约拒绝，换文件本就不该沿用旧标识）。
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const idem = section.querySelector("#m-idem").value.trim();
+        st.textContent = `上传中（${channelCN}）…`;
+        const fd = new FormData();
+        // 字段顺序即契约：knowledge_base_id 必须排在 file 之前。
+        fd.append("knowledge_base_id", kb);
+        fd.append("file", M.file, M.file.name);
+        const path = `/api/upload?channel=${encodeURIComponent(M.channel)}`;
+        const headers = Object.assign(materialsHeaders(), idem ? { "Idempotency-Key": idem } : {});
+        const r = await api(path, {
+          method: "POST", body: fd, headers,
+          brief: `上传 ${M.file.name}`,
+        });
+        // 旧身份的上传回执不得写进新身份的面板。
+        if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+        const d = r.data || {};
+        // 两条通道的回执形状：multipart={success,data:{...}}；tool={ok,result:{...}}
+        const receipt = d.data || d.result || null;
+        if (r.ok && receipt && (receipt.upload_id || (receipt.receipt && receipt.receipt.upload_id))) {
+          const rr = receipt.receipt || receipt;
+          M.receipt = Object.assign({ channel: M.channel, kb }, rr);
+          st.textContent = "上传成功";
+          renderReceipt(section);
+          section.querySelector("#m-import").disabled = false;
+          section.querySelector("#m-import-status").textContent = "";
+          return;
+        }
+        if (attempt === 1 && M.idemAuto && isIdempotencyConflict(d, r)) {
+          newIdem(section);
+          st.textContent = "这个上传标识已用于另一份文件，已自动换新标识并重试…";
+          continue;
+        }
+        st.textContent = "上传失败：" + uploadErrorText(d, r);
         st.classList.add("err");
         return;
       }
-      const rr = receipt.receipt || receipt;
-      M.receipt = Object.assign({ channel: M.channel, kb }, rr);
-      st.textContent = "上传成功";
-      renderReceipt(section);
-      section.querySelector("#m-import").disabled = false;
-      section.querySelector("#m-import-status").textContent = "";
     };
 
     // --- 导入（带上解析方式）---
@@ -696,23 +735,25 @@ function materialsMount(section) {
     section.innerHTML = `
       <div class="card">
         <h3>开发诊断</h3>
-        <div class="sub">这里放验证与开发用能力：MCP 工具台、验证清单、Markdown 写工具。主流程（上传解析、知识问答）在其余两页。</div>
+        <div class="sub">这一页给开发和验证用，普通演示流程在「资料解析」和「知识问答」两页即可完成。<br>
+        用法：左边挑一个工具 → 中间填参数（表单或 JSON）→ 点「运行」→ 下方看中文结论和原始返回。
+        所有调用都走真实的 MCP 工具，右上角「MCP 调用轨迹」里有原始请求。</div>
       </div>
       <div class="bench">
         <div class="card">
           <h3>工具目录</h3>
-          <div class="sub">来自 MCP <span class="mono">tools/list</span>（配置 Token 后加载）。</div>
-          <input id="b-filter" class="input wide" placeholder="过滤工具名…">
+          <div class="sub">共 <b id="b-count">0</b> 个工具，来自 MCP <span class="mono">tools/list</span>（配置 Token 后加载）。标「写」的会修改知识库数据，运行前会二次确认。</div>
+          <input id="b-filter" class="input wide" placeholder="按中文名或工具名过滤…">
           <div class="tool-list" id="b-list" style="margin-top:10px"></div>
         </div>
         <div class="card">
-          <div id="b-detail"><div class="empty">从左侧选择一个工具</div></div>
+          <div id="b-detail"><div class="empty">从左侧选择一个工具，这里会显示它能做什么、需要填什么</div></div>
         </div>
       </div>
       <div class="card">
         <h3>MCP 验证清单</h3>
-        <div class="sub">对上传目标知识库（或最近导入的文档）跑一遍读侧工具：状态轮询 → read_document → list_documents → 检索 → Wiki → 图谱 → 知识库状态。
-        按 KB 能力自动跳过不适用项；红叉 = 工具失败，跳过永远带原因。</div>
+        <div class="sub">对着「上传目标知识库」（或最近导入的那篇文档）把只读工具跑一遍：查状态 → 读原文 → 列文档 → 检索 → Wiki → 图谱 → 知识库状态。
+        知识库没开启的能力会自动跳过并写明原因；红色叉才是工具本身失败。</div>
         <div class="row">
           <button id="m-run-checklist" class="btn ghost">运行 / 重跑清单</button>
           <span id="m-summary" class="status-line"></span>
@@ -722,21 +763,22 @@ function materialsMount(section) {
         <div id="m-checklist"><div class="empty">在资料页完成一次导入后自动运行；也可在此直接验证已有文档。</div></div>
       </div>
       <div class="card">
-        <h3>写工具：add / update / delete_document</h3>
-        <div class="sub">破坏性操作会二次确认；update/delete 仅对 Markdown 文档生效。删除时需输入文档标题确认。</div>
+        <h3>写工具：新建 / 更新 / 删除文档</h3>
+        <div class="sub">对应 MCP 的 <span class="mono">add_document</span> / <span class="mono">update_document</span> / <span class="mono">delete_document</span>：
+        新建支持 Markdown 文本；更新与删除只对 Markdown 文档生效。删除需要输入文档标题确认，且不可撤销。</div>
         <div class="row">
           <label class="field"><span>操作</span>
             <select id="m-op" class="input select">
-              <option value="add_document">add_document</option>
-              <option value="update_document">update_document</option>
-              <option value="delete_document">delete_document</option>
+              <option value="add_document">新建文档（add_document）</option>
+              <option value="update_document">更新文档（update_document）</option>
+              <option value="delete_document">删除文档（delete_document）</option>
             </select></label>
-          <label class="field grow"><span>knowledge_id（update / delete 必填）</span>
+          <label class="field grow"><span>文档 ID（更新 / 删除必填）</span>
             <input id="m-op-id" class="input mono" autocomplete="off"></label>
         </div>
-        <div class="row"><label class="field grow"><span>标题（add 必填；update 留空保留原标题）</span>
+        <div class="row"><label class="field grow"><span>标题（新建必填；更新留空则保留原标题）</span>
           <input id="m-op-title" class="input"></label></div>
-        <div class="row"><label class="field grow"><span>Markdown 内容（add / update 必填）</span>
+        <div class="row"><label class="field grow"><span>Markdown 内容（新建 / 更新必填）</span>
           <textarea id="m-op-content" class="input" rows="4"></textarea></label></div>
         <div class="row"><button id="m-op-run" class="btn">执行</button>
           <span id="m-op-status" class="status-line"></span></div>
@@ -784,14 +826,14 @@ function materialsMount(section) {
     const content = section.querySelector("#m-op-content").value;
     let args;
     if (op === "add_document") {
-      if (!kb || !title || !content) { st.textContent = "add 需要 上传目标知识库 + 标题 + 内容"; st.classList.add("err"); return; }
+      if (!kb || !title || !content) { st.textContent = "新建需要：标题和内容；目标知识库请在「资料解析」页选择"; st.classList.add("err"); return; }
       args = { knowledge_base_id: kb, title, content };
     } else if (op === "update_document") {
-      if (!id || !content) { st.textContent = "update 需要 knowledge_id + 内容"; st.classList.add("err"); return; }
+      if (!id || !content) { st.textContent = "更新需要：文档 ID 和新的 Markdown 内容"; st.classList.add("err"); return; }
       args = { knowledge_id: id, content };
       if (title) args.title = title;
     } else {
-      if (!id) { st.textContent = "delete 需要 knowledge_id"; st.classList.add("err"); return; }
+      if (!id) { st.textContent = "删除需要：文档 ID"; st.classList.add("err"); return; }
       const okGo = await confirmDialog({
         title: "删除文档", danger: true, confirmText: "永久删除", typed: title || undefined,
         message: `将通过 MCP delete_document 删除：
@@ -802,8 +844,9 @@ ${title ? "（输入标题以确认）" : "该操作不可撤销。"}`,
       args = { knowledge_id: id };
     }
     if (op !== "delete_document") {
+      const [opCN] = toolCN(op);
       const okGo = await confirmDialog({
-        title: `执行 ${op}`, message: `将经 MCP 调用 ${op}：
+        title: `执行「${opCN}」`, message: `将经 MCP 调用 ${op}：
 ${JSON.stringify(args, null, 2).slice(0, 600)}`,
       });
       if (!okGo) return;
@@ -832,21 +875,28 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
 
   function renderToolList(section, filter) {
     const list = section.querySelector("#b-list");
+    const counter = section.querySelector("#b-count");
+    if (counter) counter.textContent = String(S.tools.length);
     list.innerHTML = "";
     if (!S.tools.length) { list.innerHTML = '<div class="empty">登录后加载工具目录</div>'; return; }
     const groups = {};
     for (const t of S.tools) {
-      if (filter && !t.name.toLowerCase().includes(filter)) continue;
+      const [cn, desc] = toolCN(t.name);
+      const hay = `${t.name} ${cn} ${desc}`.toLowerCase();
+      if (filter && !hay.includes(filter)) continue;
       (groups[groupOf(t.name)] = groups[groupOf(t.name)] || []).push(t);
     }
     for (const [g, items] of Object.entries(groups)) {
       const h = document.createElement("div");
-      h.className = "tool-group"; h.textContent = g;
+      h.className = "tool-group"; h.textContent = `${g}（${items.length}）`;
       list.appendChild(h);
       for (const t of items) {
+        const [cn, desc] = toolCN(t.name);
         const btn = document.createElement("button");
         btn.className = "tool-item" + (B.tool && B.tool.name === t.name ? " on" : "");
-        btn.innerHTML = `<span>${escapeHtml(t.name)}</span>${t.destructive ? '<span class="destructive">写</span>' : ""}`;
+        btn.title = desc || t.description || "";
+        btn.innerHTML = `<span class="tool-cn">${escapeHtml(cn)}<span class="tool-en mono">${escapeHtml(t.name)}</span></span>` +
+          (t.destructive ? '<span class="destructive">写</span>' : "");
         btn.onclick = () => { B.tool = t; renderToolDetail(section); renderToolList(section, filter); };
         list.appendChild(btn);
       }
@@ -857,9 +907,13 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
   function renderToolDetail(section) {
     const box = section.querySelector("#b-detail");
     const t = B.tool;
+    const [cn, desc] = toolCN(t.name);
     box.innerHTML = `
-      <h3>${escapeHtml(t.name)} ${t.destructive ? '<span class="badge err">破坏性</span>' : '<span class="badge ok">只读</span>'}</h3>
-      <div class="sub">${escapeHtml(t.description || "（无描述）")}</div>
+      <h3>${escapeHtml(cn)} <span class="mono small muted">${escapeHtml(t.name)}</span>
+        ${t.destructive ? '<span class="badge err">会改数据</span>' : '<span class="badge ok">只读</span>'}</h3>
+      <div class="sub">${escapeHtml(desc || "（暂无中文说明）")}</div>
+      <details class="token-help"><summary>接口原始描述（MCP 契约，英文）</summary>
+        <p>${escapeHtml(t.description || "（无描述）")}</p></details>
       <div class="row">
         <div class="seg" id="b-mode"><button data-m="form" class="on">表单</button><button data-m="json">JSON 编辑</button></div>
         <span class="grow"></span>
@@ -899,8 +953,11 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
       const label = document.createElement("label");
       label.className = "field";
       const req = required.has(name) ? ' <span class="req">*</span>' : "";
-      label.innerHTML = `<span>${escapeHtml(name)} <span class="muted">(${escapeHtml(spec.type || "any")})</span>${req} —
-        ${escapeHtml(spec.description || "")}</span>`;
+      const cn = fieldCN(name);
+      const enumHint = Array.isArray(spec.enum) ? `可选：${spec.enum.join(" / ")}` : "";
+      label.innerHTML = `<span>${cn ? `${escapeHtml(cn)} ` : ""}<span class="mono muted">${escapeHtml(name)}</span>
+        <span class="muted">(${escapeHtml(spec.type || "any")})</span>${req}</span>
+        <span class="muted" style="font-size:11px">${escapeHtml(spec.description || enumHint || "")}</span>`;
       let el;
       if (Array.isArray(spec.enum)) {
         el = document.createElement("select"); el.className = "input wide";
@@ -948,6 +1005,7 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
   async function runBenchTool(section, box) {
     const epoch = captureIdentityEpoch();
     const t = B.tool;
+    const [cn] = toolCN(t.name);
     let args;
     if (B.formMode === "json") {
       try { args = JSON.parse(box.querySelector("#b-json-text").value || "{}"); }
@@ -957,19 +1015,19 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
     }
     if (t.destructive) {
       const okGo = await confirmDialog({
-        title: `运行破坏性工具 ${t.name}`, danger: true, confirmText: "运行",
-        message: `该工具会修改 WeKnora 状态或消耗一次性凭据。\n\n参数：\n${JSON.stringify(args, null, 2).slice(0, 800)}`,
+        title: `运行「${cn}」`, danger: true, confirmText: "运行",
+        message: `这个工具会修改 WeKnora 里的数据（${t.name}）。\n\n参数：\n${JSON.stringify(args, null, 2).slice(0, 800)}`,
       });
       if (!okGo) return;
     }
     const st = box.querySelector("#b-status");
     st.classList.remove("err");
-    st.textContent = "运行中…";
-    const r = await api("/api/tool", { method: "POST", json: { name: t.name, arguments: args }, brief: t.name });
+    st.textContent = `运行中…（${cn}）`;
+    const r = await api("/api/tool", { method: "POST", json: { name: t.name, arguments: args }, brief: cn });
     if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
     const d = r.data || {};
-    st.textContent = d.ok ? `成功 · ${d.latency_ms}ms · HTTP ${d.http_status ?? r.status}`
-                          : `失败 · ${d.error || r.error || r.status}（${d.error_code || ""}）`;
+    st.textContent = d.ok ? `成功 · 耗时 ${d.latency_ms}ms`
+                          : `失败：${d.error || r.error || statusCN(r.status)}${d.error_code ? `（${d.error_code}）` : ""}`;
     if (!d.ok) st.classList.add("err");
     const pane = box.querySelector("#b-result");
     pane.innerHTML = "";

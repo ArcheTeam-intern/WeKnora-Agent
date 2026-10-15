@@ -941,8 +941,26 @@ async def upload(request: Request):
         log.warning("MCP upload failed (%s)", type(exc).__name__)
         return JSONResponse({"ok": False, "error": "MCP upload unavailable"}, status_code=502)
     if status >= 400:
-        return JSONResponse({"ok": False, "error": f"MCP upload HTTP {status}",
-            "error_code": "UNAUTHORIZED" if status == 401 else "MCP_UPLOAD_ERROR"}, status_code=status)
+        # 上游的拒绝理由要原样带给页面：幂等冲突、范围越权这类错误只有正文
+        # 说清了原因，吞掉它就只剩一个 HTTP 状态码。
+        detail, code = "", "UNAUTHORIZED" if status == 401 else "MCP_UPLOAD_ERROR"
+        try:
+            upstream = json.loads(body_text)
+        except Exception:  # noqa: BLE001
+            upstream = None
+        if isinstance(upstream, dict):
+            err = upstream.get("error")
+            if isinstance(err, dict):
+                detail = str(err.get("message") or "").strip()
+                code = str(err.get("code") or code)
+            elif err:
+                detail = str(err).strip()
+            if upstream.get("error_code"):
+                code = str(upstream["error_code"])
+        return JSONResponse({"ok": False,
+                             "error": detail or f"MCP upload HTTP {status}",
+                             "error_code": code,
+                             "upstream_status": status}, status_code=status)
     try:
         parsed = json.loads(body_text)
     except Exception:  # noqa: BLE001

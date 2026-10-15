@@ -158,6 +158,79 @@ function confirmDialog({ title, message, confirmText = "确认执行", danger = 
   });
 }
 
+/* ---------------- 中文说明层（工具 / 字段 / 接口路径）----------------
+ * 工具名、字段名和接口路径是 MCP 与服务端的英文契约，主产品会直接使用；
+ * 这里只是给控制台加一层中文说明，不改变任何对外契约。
+ */
+const TOOL_CN = {
+  list_knowledge_bases: ["列出知识库", "当前身份能看到的全部知识库，以及每个库开启了哪些能力（Wiki / 图谱 / 关键词 / 向量）。"],
+  list_parser_engines: ["列出解析引擎", "本部署真实可用的解析引擎目录：支持哪些文件类型、是否可用、不可用时是什么原因。"],
+  list_documents: ["列出文档", "某个知识库里的文档清单，带解析/索引状态，可按关键词过滤并分页。"],
+  read_document: ["读取原文", "按文档 ID 读回解析后的正文（可分页，也可只取与某个查询相关的片段）。"],
+  get_document_status: ["查询文档状态", "单个文档的解析与索引进度，以及「请求的解析引擎」和「实际执行的引擎」。"],
+  get_knowledge_base_status: ["查询知识库状态", "知识库规模与能力可用性：文档数、分块数，Wiki 与图谱是否已就绪。"],
+  get_upload_status: ["查询上传状态", "按 upload_id 查暂存状态（staged / imported / 已过期等）。"],
+  search_knowledge: ["语义检索", "混合检索（向量 + 关键词），返回命中的分块原文和来源文档。"],
+  grep_chunks: ["关键词精确匹配", "在分块里做字面匹配，适合核对编号、金额、口令这类精确字符串。"],
+  ask: ["知识问答", "一次问答：可选原生模式（快速问答 / 智能推理）、可用 session_id 续问，并限定知识库范围。"],
+  wiki_index: ["Wiki 目录", "知识库的 Wiki 总览（分组 + 页面清单），先看它再决定读哪页。"],
+  wiki_list_pages: ["Wiki 页面列表", "按类型与状态分页列出 Wiki 页面。"],
+  wiki_read_page: ["Wiki 读取页面", "读取单个 Wiki 页面正文，带页面的引用关系。"],
+  wiki_search: ["Wiki 检索", "在 Wiki 页面里检索，可选按正则匹配。"],
+  wiki_graph: ["Wiki 关系图", "Wiki 页面之间的关系边，可指定中心页与展开深度。"],
+  query_knowledge_graph: ["知识图谱查询", "按实体或关系查图谱（需要该知识库已开启图谱抽取）。"],
+  upload_file: ["上传文件", "把文件字节（base64）先暂存到知识库，返回 upload_id；同一个请求标识配同一份字节可幂等重放。"],
+  import_document_file: ["导入并解析", "把已暂存的文件变成正式文档并触发解析，可顺便指定解析引擎。"],
+  add_document: ["新建文档", "用 Markdown 文本或网址新建一篇文档。"],
+  update_document: ["更新文档", "替换 Markdown 文档的正文（可同时改标题），之后会重新索引。"],
+  delete_document: ["删除文档", "永久删除文档及其索引数据，不可撤销。"],
+};
+const FIELD_CN = {
+  knowledge_base_id: "知识库", knowledge_base_ids: "知识库范围", knowledge_id: "文档 ID",
+  upload_id: "上传 ID", file_name: "文件名", content: "内容", title: "标题", url: "网址",
+  query: "查询词", limit: "条数上限", offset: "起始位置", page: "页码", page_size: "每页条数",
+  mode: "模式", session_id: "会话 ID", process_config: "解析配置", publish: "立即发布",
+  idempotency_key: "上传请求标识", status: "状态", page_type: "页面类型", center: "中心页面",
+  depth: "展开深度", slug: "页面标识", regex: "按正则匹配", keyword: "关键词",
+};
+const PATH_CN = {
+  "/api/kbs": "读取知识库列表",
+  "/api/tools": "读取 MCP 工具目录",
+  "/api/endpoint": "读取端点信息",
+  "/api/parser-engines": "读取解析引擎目录",
+  "/api/upload": "上传文件",
+  "/api/import": "导入并解析",
+  "/api/upload_status": "查询上传状态",
+  "/api/document_status": "查询文档状态",
+  "/api/kb_status": "查询知识库状态",
+  "/api/tool": "调用 MCP 工具",
+  "/api/checklist": "运行验证清单",
+  "/api/ask": "知识问答（原生模式）",
+  "/api/chat": "知识问答（LangChain Agent）",
+  "/api/local-credential": "读取本机凭证",
+};
+function toolCN(name) { return TOOL_CN[name] || [String(name || ""), ""]; }
+function fieldCN(key) { return FIELD_CN[key] || ""; }
+function pathCN(path, payload) {
+  const base = String(path || "").split("?")[0];
+  if (base === "/api/tool" && payload && payload.name) {
+    const [cn] = toolCN(payload.name);
+    return `调用工具：${cn}`;
+  }
+  return PATH_CN[base] || base || path;
+}
+function okStatus(status) { return !!status && status >= 200 && status < 300; }
+function statusCN(status) {
+  if (!status) return "失败";
+  if (status >= 200 && status < 300) return "成功";
+  if (status === 401) return "未授权";
+  if (status === 403) return "无权限";
+  if (status === 404) return "不存在";
+  if (status === 409) return "冲突";
+  if (status === 429) return "限流";
+  return status >= 500 ? "服务端错误" : `失败 ${status}`;
+}
+
 /* ---------------- trace ---------------- */
 function traceAdd(entry) {
   S.trace.unshift(TokenSession.redact(entry));
@@ -178,12 +251,16 @@ function renderTrace() {
     const item = document.createElement("div");
     item.className = "trace-item";
     const ok = t.status >= 200 && t.status < 300;
+    const action = t.title || pathCN(t.path, t.request);
+    const context = t.brief ? ` · ${escapeHtml(t.brief)}` : "";
     item.innerHTML = `
       <div class="head">
-        <span class="path">${escapeHtml(t.method + " " + t.path)}</span>
-        <span class="badge ${ok ? "ok" : "err"}">${t.status || "ERR"}</span>
+        <span class="title-cn">${escapeHtml(action)}</span>
+        <span class="badge ${ok ? "ok" : "err"}">${escapeHtml(t.label || statusCN(t.status))}</span>
       </div>
-      <div class="meta">${escapeHtml(t.brief || "")} · ${t.latency_ms}ms · ${t.at}</div>
+      <div class="meta">${t.latency_ms}ms · ${escapeHtml(t.at)}${context}</div>
+      ${t.error ? `<div class="meta err-text">原因：${escapeHtml(String(t.error).slice(0, 200))}</div>` : ""}
+      <div class="meta mono path-line">${escapeHtml(t.method + " " + t.path)}</div>
       <div class="detail"></div>`;
     const detail = item.querySelector(".detail");
     const pre = document.createElement("pre");
@@ -224,7 +301,10 @@ async function api(path, opts = {}) {
   }
   const brief = opts.brief || (opts.json && opts.json.name) || "";
   traceAdd({
-    method, path, brief, status, latency_ms: latency,
+    method, path,
+    title: opts.title || pathCN(path, opts.json),
+    brief, status, label: statusCN(status), error: okStatus(status) ? "" : errText,
+    latency_ms: latency,
     at: new Date().toLocaleTimeString(),
     request: opts.json !== undefined ? opts.json : (body ? "(multipart/form-data)" : undefined),
     response: data,
@@ -260,8 +340,10 @@ async function sse(path, payload, onEvent, scopeHeaders) {
   });
   if (!isCurrentIdentityEpoch(epoch)) return;
   traceAdd({
-    method: "POST", path, brief: payload.question || payload.knowledge_base_id || "",
-    status: resp.status, latency_ms: 0, at: new Date().toLocaleTimeString(),
+    method: "POST", path, title: pathCN(path, payload),
+    brief: payload.question || payload.knowledge_base_id || "",
+    status: resp.status, label: okStatus(resp.status) ? "已受理（流式）" : statusCN(resp.status),
+    latency_ms: 0, at: new Date().toLocaleTimeString(),
     request: payload, response: "(SSE 流，逐条见页面)",
   });
   if (!resp.ok || !resp.body) {
@@ -637,4 +719,5 @@ window.App = {
   captureIdentityEpoch, isCurrentIdentityEpoch, advanceIdentityEpoch, setActiveProfile,
   captureQaEpoch, isCurrentQaEpoch, advanceQaEpoch,
   saveScope, renderScopeSummary,
+  toolCN, fieldCN, statusCN,
 };
