@@ -7,7 +7,13 @@ const S = {
   activeEmail: "",
   kbs: [],                // list_knowledge_bases 结果
   tools: [],              // tools/list 结果
-  selection: [],          // 选中的 KB id
+  // KB 范围按页面拆分：资料页只有一个上传目标；问答页有自己的检索范围与
+  // 原生模式。两者互不干扰，也都不再由顶栏统一编辑。
+  uploadTargetKbId: "",   // 资料页：上传/导入/状态请求只带这个库
+  qaKbIds: [],            // 问答页：ask/chat 的检索范围（空 = 未选）
+  qaScopeAll: false,      // 问答页显式选择「全部可用」时才不收窄
+  qaMode: "",             // "" = 端点默认；quick-answer / smart-reasoning
+  engines: [],            // list_parser_engines 结果（资料页解析方式）
   endpoint: null,
   trace: [],
   ui: { view: "materials" },
@@ -15,28 +21,96 @@ const S = {
 
 const LS_PROFILES = "wk_console_profiles_v2";
 const LS_ACTIVE = "wk_console_active_v2";
-const LS_SELECTION = "wk_console_selection_v2";
+const LS_SCOPE = "wk_console_scope_v3";
+
+/* ---------------- 身份 epoch ----------------
+ * 每次身份变化（连接/切换/断开/401 失效）都推进一个单调递增的 epoch。
+ * 任何异步操作在发起时捕获 epoch，在 await 之后、SSE 回调与 catch/finally
+ * 写共享状态或 DOM 之前检查它；旧身份的迟到响应因此不能改写新身份的状态、
+ * DOM 或 busy 标记，也不能把旧 session_id 带进新身份的后续请求。
+ */
+let identityEpoch = 0;
+function captureIdentityEpoch() { return identityEpoch; }
+function isCurrentIdentityEpoch(epoch) { return epoch === identityEpoch; }
+function advanceIdentityEpoch() { identityEpoch += 1; return identityEpoch; }
+
+/* 身份切换会替换该标签页的全部连接态：轨迹属于上一次连接，清掉避免混用。 */
+function resetIdentityScopedState() {
+  S.kbs = [];
+  S.tools = [];
+  S.engines = [];
+  S.uploadTargetKbId = "";
+  S.qaKbIds = [];
+  S.qaScopeAll = false;
+  S.trace = [];
+  saveScope();
+  renderTrace();
+  document.getElementById("tool-count").textContent = "–";
+  renderScopeSummary();
+}
 
 /* ---------------- 本地存储 ---------------- */
 function loadLocal() {
-  try { S.profiles = JSON.parse(localStorage.getItem(LS_PROFILES) || "[]"); } catch (_) { S.profiles = []; }
-  S.activeEmail = localStorage.getItem(LS_ACTIVE) || "";
-  try { S.selection = JSON.parse(localStorage.getItem(LS_SELECTION) || "[]"); } catch (_) { S.selection = []; }
+  try { S.profiles = JSON.parse(sessionStorage.getItem(LS_PROFILES) || "[]").map(p => TokenSession.normalize(p)); } catch (_) { S.profiles = []; }
+  S.activeEmail = sessionStorage.getItem(LS_ACTIVE) || "";
+  // Retire the old permanent JWT cache; credentials now last only this tab.
+  localStorage.removeItem(LS_PROFILES);
+  localStorage.removeItem(LS_ACTIVE);
+  try {
+    const scope = JSON.parse(localStorage.getItem(LS_SCOPE) || "{}");
+    S.uploadTargetKbId = String(scope.uploadTargetKbId || "");
+    S.qaKbIds = Array.isArray(scope.qaKbIds) ? scope.qaKbIds.filter(Boolean) : [];
+    S.qaScopeAll = !!scope.qaScopeAll;
+    S.qaMode = String(scope.qaMode || "");
+  } catch (_) { /* 保持默认（全部未选） */ }
 }
-function saveProfiles() { localStorage.setItem(LS_PROFILES, JSON.stringify(S.profiles)); }
-function saveSelection() { localStorage.setItem(LS_SELECTION, JSON.stringify(S.selection)); }
-function activeProfile() { return S.profiles.find(p => p.email === S.activeEmail) || null; }
+function saveProfiles() { sessionStorage.setItem(LS_PROFILES, JSON.stringify(S.profiles)); }
+function saveScope() {
+  localStorage.setItem(LS_SCOPE, JSON.stringify({
+    uploadTargetKbId: S.uploadTargetKbId, qaKbIds: S.qaKbIds,
+    qaScopeAll: S.qaScopeAll, qaMode: S.qaMode,
+  }));
+}
+function activeProfile() {
+  const p = S.profiles.find(p => p.email === S.activeEmail) || null;
+  return p && p.expires_at * 1000 > Date.now() ? p : null;
+}
 
-/* ---------------- headers ---------------- */
-function mcpHeaders() {
+/* ---------------- headers ----------------
+ * The KB scope is per request and per page: no global selection exists any
+ * more, so an upload target and a QA range can never disagree silently.
+ */
+function mcpHeaders(opts) {
   const p = activeProfile();
   if (!p) return {};
   const h = {
     "X-WeKnora-User-Token": p.token,
     "X-Tenant-ID": String(p.tenant_id || ""),
   };
-  if (S.selection.length) h["X-WeKnora-Knowledge-Base-Ids"] = S.selection.join(",");
+  const kbIds = (opts && opts.kbIds) || [];
+  if (kbIds.length) h["X-WeKnora-Knowledge-Base-Ids"] = kbIds.join(",");
   return h;
+}
+// 资料页：上传/导入/状态只作用于上传目标
+function materialsHeaders() {
+  return mcpHeaders({ kbIds: S.uploadTargetKbId ? [S.uploadTargetKbId] : [] });
+}
+// 问答页：显式「全部可用」时不收窄；未选任何库时同样不收窄但界面禁用发送
+function qaHeaders() {
+  return mcpHeaders({ kbIds: S.qaScopeAll ? [] : S.qaKbIds });
+}
+
+/* ---------------- 问答范围 epoch ----------------
+ * 切换问答知识库范围或原生模式都会开启一个新的逻辑会话：旧范围/旧模式
+ * 的在途回答不得写回新范围，也不能把旧 session_id 带进后续提问。
+ */
+let qaEpoch = 0;
+function captureQaEpoch() { return qaEpoch; }
+function isCurrentQaEpoch(epoch) { return epoch === qaEpoch; }
+function advanceQaEpoch() {
+  qaEpoch += 1;
+  const q = window.Views && Views.resetQaScopeState ? Views.resetQaScopeState() : null;
+  return qaEpoch;
 }
 
 /* ---------------- toast / modal ---------------- */
@@ -86,7 +160,7 @@ function confirmDialog({ title, message, confirmText = "确认执行", danger = 
 
 /* ---------------- trace ---------------- */
 function traceAdd(entry) {
-  S.trace.unshift(entry);
+  S.trace.unshift(TokenSession.redact(entry));
   if (S.trace.length > 200) S.trace.pop();
   renderTrace();
 }
@@ -123,9 +197,11 @@ function renderTrace() {
 
 /* ---------------- HTTP ---------------- */
 async function api(path, opts = {}) {
+  const epoch = captureIdentityEpoch();
   const started = performance.now();
   const method = opts.method || "GET";
   const headers = Object.assign({}, mcpHeaders(), opts.headers || {});
+  if (opts.identityOnly) delete headers['X-WeKnora-Knowledge-Base-Ids'];
   let body = opts.body;
   if (opts.json !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -142,6 +218,10 @@ async function api(path, opts = {}) {
     errText = e.message;
   }
   const latency = Math.round(performance.now() - started);
+  // 迟到的旧身份响应：不写轨迹、不触发失效、不把结果交给调用方继续写状态。
+  if (!isCurrentIdentityEpoch(epoch)) {
+    return { ok: false, stale: true, status, data: null, error: "身份已切换，忽略旧响应", latency_ms: latency };
+  }
   const brief = opts.brief || (opts.json && opts.json.name) || "";
   traceAdd({
     method, path, brief, status, latency_ms: latency,
@@ -149,23 +229,43 @@ async function api(path, opts = {}) {
     request: opts.json !== undefined ? opts.json : (body ? "(multipart/form-data)" : undefined),
     response: data,
   });
-  if (status === 401) toast("登录态失效：请重新登录该账号", "err");
+  if (TokenSession.isAuthError(status, data || {})) invalidateCredential(headers['X-WeKnora-User-Token']);
   return { ok: status >= 200 && status < 300, status, data, error: errText, latency_ms: latency };
+}
+function invalidateCredential(requestToken) {
+  const current = S.profiles.find(p => p.email === S.activeEmail);
+  if (!TokenSession.canInvalidate(requestToken, current)) return;
+  // 失效即身份变化：先推进 epoch，让所有在途请求的写回全部作废。
+  advanceIdentityEpoch();
+  S.profiles = S.profiles.filter(p => p.token !== requestToken);
+  S.activeEmail = '';
+  sessionStorage.removeItem(LS_ACTIVE);
+  resetIdentityScopedState();
+  saveProfiles(); renderUserSelect(); renderScopeSummary();
+  if (window.Views) Views.onIdentityChanged();
+  document.getElementById('endpoint-badge').textContent = 'MCP · 凭证已失效';
+  toast('Token 已失效，请用独立凭证工具重新获取，再点击「配置 Token」导入。', 'err');
 }
 
 /* ---------------- SSE ---------------- */
-async function sse(path, payload, onEvent) {
+async function sse(path, payload, onEvent, scopeHeaders) {
+  const epoch = captureIdentityEpoch();
+  // 调用方给出页面级身份头（问答范围），未给出时退化为仅身份头。
+  const requestHeaders = Object.assign({ 'Content-Type': 'application/json' },
+    scopeHeaders || mcpHeaders());
   const resp = await fetch(path, {
     method: "POST",
-    headers: Object.assign({ "Content-Type": "application/json" }, mcpHeaders()),
+    headers: requestHeaders,
     body: JSON.stringify(payload),
   });
+  if (!isCurrentIdentityEpoch(epoch)) return;
   traceAdd({
     method: "POST", path, brief: payload.question || payload.knowledge_base_id || "",
     status: resp.status, latency_ms: 0, at: new Date().toLocaleTimeString(),
     request: payload, response: "(SSE 流，逐条见页面)",
   });
   if (!resp.ok || !resp.body) {
+    if (resp.status === 401) invalidateCredential(requestHeaders['X-WeKnora-User-Token']);
     let detail = "";
     try { detail = (await resp.json()).error || ""; } catch (_) {}
     throw new Error(detail || ("HTTP " + resp.status));
@@ -176,14 +276,19 @@ async function sse(path, payload, onEvent) {
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+    // 流可能跨越身份切换：切换后到站的帧一律丢弃，不投递给视图回调。
+    if (!isCurrentIdentityEpoch(epoch)) return;
     buf += decoder.decode(value, { stream: true });
     const frames = buf.split(/\r?\n\r?\n/);
     buf = frames.pop();
     for (const frame of frames) {
+      if (!isCurrentIdentityEpoch(epoch)) return;
       const line = frame.split(/\r?\n/).find(l => l.startsWith("data:"));
       if (!line) continue;
       let evt;
       try { evt = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
+      if (TokenSession.isAuthError(resp.status, evt)) invalidateCredential(requestHeaders['X-WeKnora-User-Token']);
+      if (!isCurrentIdentityEpoch(epoch)) return;
       onEvent(evt);
     }
   }
@@ -238,9 +343,9 @@ function renderUserSelect() {
   sel.innerHTML = "";
   if (!S.profiles.length) {
     const o = document.createElement("option");
-    o.value = ""; o.textContent = "（未登录）";
+    o.value = ""; o.textContent = TokenSession.DEFAULT_EMAIL;
     sel.appendChild(o);
-    return;
+    updateTokenStatus(); return;
   }
   for (const p of S.profiles) {
     const o = document.createElement("option");
@@ -249,60 +354,90 @@ function renderUserSelect() {
     if (p.email === S.activeEmail) o.selected = true;
     sel.appendChild(o);
   }
+  updateTokenStatus();
+}
+function updateTokenStatus() {
+  const el = document.getElementById("token-status");
+  if (!el) return;
+  const p = activeProfile();
+  el.className = "badge " + (p ? "ok" : "gray");
+  el.textContent = p ? "已连接 · " + new Date(p.expires_at * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) + " 到期" : "待配置有效 Token";
 }
 function setActiveProfile(email) {
+  // 切换用户即身份变化：推进 epoch 使旧身份的在途请求全部作废。
+  advanceIdentityEpoch();
   S.activeEmail = email;
-  localStorage.setItem(LS_ACTIVE, email);
+  sessionStorage.setItem(LS_ACTIVE, email);
+  resetIdentityScopedState();
   renderUserSelect();
-  refreshAfterIdentity();
+  renderScopeSummary();
+  if (window.Views) Views.onIdentityChanged();
+  return refreshAfterIdentity();
 }
 
-/* ---------------- 顶栏：KB 选择 ---------------- */
-function renderKbChips() {
-  const box = document.getElementById("kb-chips");
-  box.innerHTML = "";
-  if (!activeProfile()) { box.innerHTML = '<span class="muted">登录后自动加载…</span>'; return; }
-  if (!S.kbs.length) { box.innerHTML = '<span class="muted">没有可见的知识库</span>'; return; }
-  for (const kb of S.kbs) {
-    const chip = document.createElement("span");
-    const on = S.selection.includes(kb.id);
-    chip.className = "chip" + (on ? " on" : "");
-    const caps = [];
-    const flags = kb.capability_flags || {};
-    if (flags.vector) caps.push("向量");
-    if (flags.keyword) caps.push("关键词");
-    if (flags.wiki) caps.push("Wiki");
-    if (flags.graph) caps.push("图谱");
-    chip.innerHTML = `${escapeHtml(kb.name)}<span class="caps">${caps.join("·") || "无检索能力"}</span>`;
-    chip.title = kb.id;
-    chip.onclick = () => {
-      S.selection = on ? S.selection.filter(id => id !== kb.id) : S.selection.concat([kb.id]);
-      saveSelection();
-      renderKbChips();
-      if (window.Views) Views.onSelectionChanged();
-    };
-    box.appendChild(chip);
-  }
+/* ---------------- 顶栏：只读范围摘要 ----------------
+ * 顶栏不再提供全局可编辑选择器：上传目标和问答范围各自在页面里选择，
+ * 顶栏只显示两者的当前值，避免「看到 A、实际写 B」这类冲突。
+ */
+function scopeSummaryText() {
+  if (!activeProfile()) return "配置有效 Token 后加载知识库";
+  if (!S.kbs.length) return "没有可见的知识库";
+  const nameOf = id => (S.kbs.find(k => k.id === id) || {}).name || id.slice(0, 8);
+  const upload = S.uploadTargetKbId ? nameOf(S.uploadTargetKbId) : "未选择";
+  const qa = S.qaScopeAll ? "全部可用" : (S.qaKbIds.length ? S.qaKbIds.map(nameOf).join("、") : "未选择");
+  return `共 ${S.kbs.length} 个知识库 · 资料页目标：${upload} · 问答范围：${qa}`;
+}
+
+function renderScopeSummary() {
+  const el = document.getElementById("scope-summary");
+  if (!el) return;
+  el.textContent = scopeSummaryText();
 }
 
 async function loadKbs() {
-  if (!activeProfile()) { S.kbs = []; renderKbChips(); return; }
+  if (!activeProfile()) { S.kbs = []; renderScopeSummary(); return; }
+  const epoch = captureIdentityEpoch();
   const r = await api("/api/kbs", { brief: "list_knowledge_bases" });
+  if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
   if (r.ok && r.data && r.data.ok) {
     S.kbs = r.data.result.knowledge_bases || [];
     const valid = new Set(S.kbs.map(k => k.id));
-    S.selection = S.selection.filter(id => valid.has(id));
-    saveSelection();
+    // 不可见的库必须从两个页面的范围里同时剔除，避免把越权 id 发出去。
+    if (S.uploadTargetKbId && !valid.has(S.uploadTargetKbId)) S.uploadTargetKbId = "";
+    S.qaKbIds = S.qaKbIds.filter(id => valid.has(id));
+    if (!S.uploadTargetKbId && S.kbs.length) S.uploadTargetKbId = S.kbs[0].id;
+    saveScope();
   } else {
     S.kbs = [];
     toast("加载知识库失败：" + ((r.data && r.data.error) || r.error || r.status), "err");
   }
-  renderKbChips();
+  renderScopeSummary();
+  if (window.Views && Views.onSelectionChanged) Views.onSelectionChanged();
+}
+
+// loadEngines fetches the deployment's parser catalog through MCP
+// (list_parser_engines). Endpoints that do not expose the tool fall back to
+// "knowledge base default" instead of blocking the upload page.
+async function loadEngines() {
+  S.engines = [];
+  if (!activeProfile()) { renderScopeSummary(); return; }
+  const epoch = captureIdentityEpoch();
+  const r = await api("/api/parser-engines", { brief: "list_parser_engines" });
+  if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+  if (r.ok && r.data && r.data.ok) {
+    S.engines = (r.data.result && r.data.result.engines) || [];
+  } else {
+    S.engines = [];
+    toast("解析引擎目录不可用（端点未开放 list_parser_engines），将使用知识库默认解析", "err");
+  }
+  if (window.Views && Views.onSelectionChanged) Views.onSelectionChanged();
 }
 
 async function loadTools() {
   if (!activeProfile()) { S.tools = []; return; }
+  const epoch = captureIdentityEpoch();
   const r = await api("/api/tools", { brief: "tools/list" });
+  if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
   if (r.ok && r.data && r.data.ok) {
     S.tools = r.data.tools || [];
     document.getElementById("tool-count").textContent = String(S.tools.length);
@@ -314,67 +449,130 @@ async function loadTools() {
 async function loadEndpoint() {
   const badge = document.getElementById("endpoint-badge");
   if (!activeProfile()) { badge.className = "badge gray"; badge.textContent = "未登录"; return; }
-  const r = await api("/api/endpoint", { brief: "GET mcp-endpoint" });
+  const epoch = captureIdentityEpoch();
+  const r = await api("/api/endpoint", { brief: "MCP 连接信息" });
+  if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
   const d = r.data || {};
   S.endpoint = d;
   if (d.ok) {
     badge.className = "badge ok";
-    badge.textContent = `${d.name || d.endpoint_id} · ${d.require_user_identity ? "用户模式" : "机器模式"} · ${(d.tools || []).length} 工具 · ${(d.knowledge_base_ids || []).length} KB`;
-    badge.title = `endpoint_id=${d.endpoint_id} rate_limit=${d.rate_limit_per_minute || "-"}/min`;
+    badge.textContent = `MCP · ${(d.tools || []).length} 个工具`;
+    badge.title = `endpoint_id=${d.endpoint_id || ""}`;
   } else {
     badge.className = "badge warn";
-    badge.textContent = `端点 ${d.endpoint_id || "?"}（管理接口不可读）`;
+    badge.textContent = "MCP 暂未连接";
     badge.title = d.error || "";
   }
 }
 
 async function refreshAfterIdentity() {
   await Promise.all([loadKbs(), loadTools(), loadEndpoint()]);
+  await loadEngines();
   if (window.Views) Views.onSelectionChanged();
 }
 
 /* ---------------- 登录 ---------------- */
 async function openLoginDialog() {
-  const r = await api("/api/accounts", { brief: "GET accounts" });
-  if (!r.ok || !r.data) { toast("无法读取账号档案", "err"); return; }
-  S.accounts = r.data.accounts || [];
   openModal(box => {
-    const h = document.createElement("h3"); h.textContent = "登录 WeKnora 账号"; box.appendChild(h);
-    const note = document.createElement("div"); note.className = "sub";
-    note.textContent = "凭据来自本机 accounts.json，只用于换取新鲜 JWT；控制台不缓存 token。";
-    box.appendChild(note);
-    const lab1 = document.createElement("label"); lab1.className = "field"; lab1.innerHTML = "<span>账号</span>";
-    const sel = document.createElement("select"); sel.className = "input wide";
-    for (const a of S.accounts) {
-      const o = document.createElement("option"); o.value = a.email;
-      o.textContent = `${a.name}（${a.email}）`; sel.appendChild(o);
-    }
-    lab1.appendChild(sel); box.appendChild(lab1);
-    const lab2 = document.createElement("label"); lab2.className = "field"; lab2.innerHTML = "<span>密码</span>";
-    const pw = document.createElement("input"); pw.type = "password"; pw.className = "input wide";
-    lab2.appendChild(pw); box.appendChild(lab2);
-    const status = document.createElement("div"); status.className = "status-line"; box.appendChild(status);
-    const actions = document.createElement("div"); actions.className = "modal-actions";
-    const cancel = document.createElement("button"); cancel.className = "btn ghost"; cancel.textContent = "取消";
-    const ok = document.createElement("button"); ok.className = "btn"; ok.textContent = "登录";
-    actions.append(cancel, ok); box.appendChild(actions);
-    cancel.onclick = closeModal;
-    ok.onclick = async () => {
-      ok.disabled = true; status.textContent = "登录中…";
-      const resp = await api("/api/login", { method: "POST", json: { email: sel.value, password: pw.value }, brief: "login " + sel.value });
-      ok.disabled = false;
-      if (!resp.ok || !resp.data || !resp.data.token) {
-        status.textContent = "登录失败：" + ((resp.data && resp.data.error) || resp.error || resp.status);
-        status.classList.add("err"); return;
-      }
-      const p = Object.assign({}, resp.data.profile, { token: resp.data.token });
-      S.profiles = S.profiles.filter(x => x.email !== p.email).concat([p]);
-      saveProfiles();
-      closeModal();
-      setActiveProfile(p.email);
-      toast(`已登录 ${p.name}`, "ok");
+    const profile = activeProfile();
+    box.innerHTML = `
+      <div class="eyebrow">CONNECT YOUR WORKSPACE</div>
+      <h3>连接知识工作台</h3>
+      <p class="sub">导入独立凭证工具生成的文件，或填写 WeKnora 用户 Token。知识操作仅经 MCP；工作台不保存账号密码。</p>
+      <div class="row credential-quick">
+        <button id="credential-local" class="btn">🔄 读取本机凭证</button>
+        <span class="muted" style="font-size:12px">由独立工具生成；过期时先在终端跑一次 scripts/refresh-credential.ps1</span>
+      </div>
+      <label class="credential-import">导入凭证 JSON<input id="credential-file" type="file" accept=".json,application/json"></label>
+      <div class="credential-divider"><span>或者手动填写</span></div>
+      <label class="field"><span>账号</span><input id="credential-email" class="input wide" type="email" autocomplete="username"></label>
+      <label class="field"><span>工作空间 ID</span><input id="credential-workspace" class="input wide" inputmode="numeric" placeholder="例如 2"></label>
+      <label class="field"><span>用户访问 Token（JWT）</span><input id="credential-token" class="input wide mono" type="password" autocomplete="off" placeholder="粘贴 WeKnora 签发的用户 Token"></label>
+      <details class="token-help"><summary>如何获取新的 Token？</summary><p>在本仓库运行一条命令：<code>powershell -ExecutionPolicy Bypass -File scripts\refresh-credential.ps1</code>（内部调用 WeKnora 的官方签发工具，签发后同步 .env 供 CLI 使用、并写好凭证文件）；回到本弹窗点「读取本机凭证」即可。也可以直接粘贴主产品身份链路签发的 JWT。端点 Token 由服务端配置，无需在此填写。</p></details>
+      <div id="credential-status" class="status-line" role="status"></div>
+      <div class="modal-actions"><button id="credential-clear" class="btn ghost">断开连接</button><span class="grow"></span><button id="credential-cancel" class="btn ghost">取消</button><button id="credential-apply" class="btn">连接工作台</button></div>`;
+    const email = box.querySelector('#credential-email');
+    const workspace = box.querySelector('#credential-workspace');
+    const token = box.querySelector('#credential-token');
+    const status = box.querySelector('#credential-status');
+    const button = box.querySelector('#credential-apply');
+    email.value = profile?.email || TokenSession.DEFAULT_EMAIL;
+    workspace.value = profile?.tenant_id || '2';
+    let imported = null;
+    // 读取本机凭证：只读取独立工具写下的文件（工作台不做登录、不碰密码），
+    // 读到的凭据仍要经过下面的 MCP 校验才会成为有效连接。
+    box.querySelector('#credential-local').onclick = async () => {
+      const quick = box.querySelector('#credential-local');
+      quick.disabled = true;
+      status.classList.remove('err');
+      status.textContent = '正在读取本机凭证文件…';
+      try {
+        const result = await api('/api/local-credential', { brief: '读取本机凭证' });
+        const data = result.data || {};
+        if (!result.ok || !data.available) throw new Error(data.hint || '没有可用的本机凭证');
+        imported = data.credential;
+        const value = TokenSession.normalize(imported);
+        email.value = value.email;
+        workspace.value = value.tenant_id;
+        token.value = value.token;
+        status.textContent = `凭证已读取（${data.credential.expires_at || '有效期未知'}），点击连接后由 WeKnora 校验。`;
+      } catch (err) {
+        status.classList.add('err');
+        status.textContent = err.message;
+      } finally { quick.disabled = false; }
     };
-    pw.focus();
+    box.querySelector('#credential-file').onchange = async e => {
+      try {
+        const file = e.target.files[0];
+        if (!file) return;
+        if (file.size > 32768) throw new Error('凭证文件过大，请选择生成的 Token JSON');
+        imported = JSON.parse(await file.text());
+        const value = TokenSession.normalize(imported);
+        email.value = value.email;
+        workspace.value = value.tenant_id;
+        token.value = value.token;
+        status.classList.remove('err');
+        status.textContent = '凭证已读取，点击连接后由 WeKnora 校验。';
+      } catch (err) { status.classList.add('err'); status.textContent = err.message; }
+    };
+    box.querySelector('#credential-cancel').onclick = closeModal;
+    box.querySelector('#credential-clear').onclick = () => {
+      advanceIdentityEpoch();
+      S.profiles = []; S.activeEmail = '';
+      sessionStorage.removeItem(LS_PROFILES); sessionStorage.removeItem(LS_ACTIVE);
+      resetIdentityScopedState();
+      saveProfiles(); renderUserSelect(); renderScopeSummary();
+      document.getElementById('endpoint-badge').textContent = 'MCP · 待连接';
+      if (window.Views) Views.onIdentityChanged();
+      closeModal(); toast('已断开，此标签页的 Token 已清除');
+    };
+    button.onclick = async () => {
+      const oldProfiles = S.profiles, oldEmail = S.activeEmail;
+      // 连接即身份变化：先推进 epoch，旧连接的在途请求不得再回写。
+      const epoch = advanceIdentityEpoch();
+      try {
+        const value = TokenSession.normalize({ token: token.value,
+          profile: { ...(imported?.profile || {}), email: email.value, tenant_id: workspace.value } });
+        button.disabled = true; status.classList.remove('err'); status.textContent = '正在通过 MCP 校验连接…';
+        S.profiles = [value]; S.activeEmail = value.email;
+        resetIdentityScopedState();
+        const result = await api('/api/kbs', { brief: '验证 MCP 用户凭证', identityOnly: true });
+        if (!isCurrentIdentityEpoch(epoch) || result.stale) return;
+        if (!result.ok || !result.data?.ok) throw new Error(result.data?.error || result.error || 'MCP 拒绝了此 Token，请重新获取');
+        saveProfiles(); sessionStorage.setItem(LS_ACTIVE, value.email);
+        renderUserSelect();
+        if (window.Views) Views.onIdentityChanged();
+        await refreshAfterIdentity();
+        closeModal(); toast('已连接 ' + value.email, 'ok');
+      } catch (err) {
+        // 回滚也是身份变化：再次推进 epoch，让失败尝试期间的响应同样作废。
+        advanceIdentityEpoch();
+        S.profiles = oldProfiles; S.activeEmail = oldEmail;
+        resetIdentityScopedState();
+        saveProfiles(); renderUserSelect(); renderScopeSummary();
+        status.classList.add('err'); status.textContent = err.message;
+      } finally { button.disabled = false; }
+    };
   });
 }
 
@@ -386,6 +584,13 @@ function currentRoute() {
 function applyRoute() {
   const route = currentRoute();
   S.ui.view = route;
+  const headings = {
+    materials: ['从一份资料开始', '上传、解析、核对原文，让每一次回答都有依据。'],
+    qa: ['向知识提问', '连接你的资料，通过原文与引用找到可靠答案。'],
+    bench: ['让每一次调用可见', '浏览可用能力，验证参数、结果与原文来源。'],
+  };
+  document.getElementById('page-title').textContent = headings[route][0];
+  document.getElementById('page-description').textContent = headings[route][1];
   for (const name of ["materials", "qa", "bench"]) {
     const sec = document.getElementById("view-" + name);
     sec.classList.toggle("hidden", name !== route);
@@ -400,20 +605,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   loadLocal();
   if (!S.activeEmail && S.profiles.length) S.activeEmail = S.profiles[0].email;
   renderUserSelect();
-  renderKbChips();
+  renderScopeSummary();
   renderTrace();
 
   document.getElementById("login-btn").onclick = openLoginDialog;
   document.getElementById("user-select").onchange = e => {
     if (e.target.value) setActiveProfile(e.target.value);
-  };
-  document.getElementById("kb-all").onclick = () => {
-    S.selection = S.kbs.map(k => k.id); saveSelection(); renderKbChips();
-    if (window.Views) Views.onSelectionChanged();
-  };
-  document.getElementById("kb-none").onclick = () => {
-    S.selection = []; saveSelection(); renderKbChips();
-    if (window.Views) Views.onSelectionChanged();
   };
   const drawer = document.getElementById("trace-drawer");
   document.getElementById("trace-toggle").onclick = () => drawer.classList.toggle("open");
@@ -428,11 +625,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.title = `WeKnora MCP 控制台 · ${info.data.model || ""}`;
   }
   if (activeProfile()) await refreshAfterIdentity();
-  else toast("请先点右上角「登录 / 切换」选择账号", "");
+  else toast("点击「配置 Token」，导入有效的 WeKnora 用户凭证");
+  setInterval(updateTokenStatus, 30000);
 });
 
 /* 供 views.js 使用 */
 window.App = {
   S, api, sse, toast, confirmDialog, openModal, closeModal,
-  renderMarkdown, escapeHtml, mcpHeaders, activeProfile, loadKbs, refreshAfterIdentity,
+  renderMarkdown, escapeHtml, mcpHeaders, materialsHeaders, qaHeaders,
+  activeProfile, loadKbs, loadEngines, refreshAfterIdentity,
+  captureIdentityEpoch, isCurrentIdentityEpoch, advanceIdentityEpoch, setActiveProfile,
+  captureQaEpoch, isCurrentQaEpoch, advanceQaEpoch,
+  saveScope, renderScopeSummary,
 };

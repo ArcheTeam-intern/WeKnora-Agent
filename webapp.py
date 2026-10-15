@@ -11,15 +11,8 @@ What the shell does:
   2. relay the required MCP headers (Authorization / X-WeKnora-User-Token /
      X-Tenant-ID / X-WeKnora-Knowledge-Base-Ids) from the browser to the MCP
      server unchanged, so the caller's identity is the same on every tool
-  3. expose a login proxy that exchanges a local accounts.json entry for a
-     fresh WeKnora JWT via POST /api/v1/auth/login. The shell never caches
-     that JWT: the browser holds it and sends it back on every request as
-     X-WeKnora-User-Token. Credentials live in accounts.json (gitignored,
-     never served statically); the shell refuses emails that are not in
-     that file so it can never act as an open login proxy.
-  4. proxy explicit MCP calls the console needs: tools/list, generic
-     tools/call, the multipart upload transport, and an SSE checklist that
-     walks the read/wiki/graph/status tools for one document.
+  3. accept an externally issued user JWT on each request
+  4. proxy tools/list, tools/call, multipart uploads and SSE verification.
 
 Configuration: AGENT_MODEL / AGENT_MODEL_BASE_URL / AGENT_MODEL_API_KEY
 identify the model; WEKNORA_MCP_URL + WEKNORA_MCP_TOKEN identify the MCP
@@ -31,6 +24,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -69,7 +63,7 @@ CHECKLIST_STEP_TIMEOUT = 60
 # present-but-empty = error). The console mirrors that: the KB header is
 # forwarded when the browser has a selection and omitted otherwise, because
 # discovery (list_knowledge_bases) necessarily happens before any selection
-# exists. Login / accounts / info are the only routes without identity.
+# exists. Only info and static assets are public.
 _REQUIRED_HEADERS = (
     "X-WeKnora-User-Token",
     "X-Tenant-ID",
@@ -87,10 +81,6 @@ DESTRUCTIVE_TOOLS = frozenset({
     "update_document",
     "delete_document",
 })
-
-# Local credential file for the login proxy. Overridden in tests.
-ACCOUNTS_PATH = ROOT / "accounts.json"
-
 
 # --- identity header relay --------------------------------------------------
 
@@ -129,14 +119,8 @@ def _build_connection(endpoint_token: str, user_headers: dict[str, str]):
     this specific request. Each call gets its own dict so concurrent
     requests do not share state.
     """
-    connections = load_connections(ROOT / "mcp.json")
-    conn = connections["weknora"]
-    headers = dict(conn.get("headers") or {})
-    headers["Authorization"] = "Bearer " + endpoint_token
-    for k, v in user_headers.items():
-        headers[k] = v
-    conn["headers"] = headers
-    return connections
+    return load_connections(ROOT / "mcp.json", header_overrides={
+        "Authorization": "Bearer " + endpoint_token, **user_headers})
 
 
 def _endpoint_token() -> str:
@@ -146,7 +130,7 @@ def _endpoint_token() -> str:
 
 def _mcp_endpoint_target() -> tuple[str, str]:
     """Return (weknora_base_url, endpoint_id) from mcp.json / .env."""
-    connections = load_connections(ROOT / "mcp.json")
+    connections = load_connections(ROOT / "mcp.json", header_overrides={"Authorization": ""})
     url = (connections["weknora"].get("url") or "").strip()
     endpoint_id = ""
     if "/mcp/" in url:
@@ -155,130 +139,10 @@ def _mcp_endpoint_target() -> tuple[str, str]:
     return url.rstrip("/"), endpoint_id
 
 
-# --- local accounts + login proxy ------------------------------------------
-
-def _load_accounts() -> list[dict]:
-    """Read accounts.json. Tolerates both {"accounts": [...]} and a bare
-    list; a missing or malformed file yields an empty list (login then
-    refuses everything, which is the safe direction).
-    """
-    try:
-        raw = json.loads(ACCOUNTS_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        log.warning("accounts.json not found at %s; login disabled", ACCOUNTS_PATH)
-        return []
-    except Exception as exc:  # noqa: BLE001
-        log.warning("accounts.json is not readable JSON: %s", exc)
-        return []
-    entries = raw.get("accounts") if isinstance(raw, dict) else raw
-    if not isinstance(entries, list):
-        return []
-    out = []
-    for item in entries:
-        if not isinstance(item, dict):
-            continue
-        email = str(item.get("email") or "").strip()
-        password = str(item.get("password") or "")
-        if not email or not password:
-            continue
-        out.append({"name": str(item.get("name") or email).strip(),
-                    "email": email, "password": password})
-    return out
-
-
-def _find_account(email: str) -> dict | None:
-    email = email.strip().lower()
-    for item in _load_accounts():
-        if item["email"].lower() == email:
-            return item
-    return None
-
-
-class LoginError(Exception):
-    def __init__(self, status_code: int, message: str):
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
-
-
-async def _login_upstream(email: str, password: str) -> dict:
-    """Exchange credentials for a fresh JWT at WeKnora. Tests patch this."""
-    base, _ = _mcp_endpoint_target()
-    payload = json.dumps({"email": email, "password": password},
-                         ensure_ascii=False).encode("utf-8")
-
-    def _do() -> tuple[int, str]:
-        import urllib.error
-        import urllib.request
-        req = urllib.request.Request(base + "/api/v1/auth/login",
-                                     data=payload, method="POST")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.status, resp.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read().decode("utf-8", "ignore")
-
-    status, raw = await asyncio.to_thread(_do)
-    if status != 200:
-        raise LoginError(401 if status in (400, 401) else status,
-                         "账号或密码错误" if status in (400, 401)
-                         else f"WeKnora 登录失败（HTTP {status}）")
-    try:
-        return json.loads(raw)
-    except Exception as exc:  # noqa: BLE001
-        raise LoginError(502, f"登录响应不是合法 JSON：{exc}") from exc
-
-
-async def accounts(request: Request):
-    """List the allowlisted accounts. Never returns passwords."""
-    return JSONResponse({"accounts": [
-        {"name": item["name"], "email": item["email"]}
-        for item in _load_accounts()
-    ]})
-
-
-async def login(request: Request):
-    """Exchange an allowlisted account's password for a fresh JWT.
-
-    The JWT is returned to the browser and NOT cached here: every later
-    request re-sends it as X-WeKnora-User-Token, so identity handling
-    stays request-scoped and an expired token degrades to one visible
-    401 instead of a silent server-side refresh.
-    """
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        return JSONResponse({"error": "request body must be JSON"}, status_code=400)
-    email = (body.get("email") or "").strip()
-    password = body.get("password") or ""
-    if not email or not password:
-        return JSONResponse({"error": "email and password are required"}, status_code=400)
-    account = _find_account(email)
-    if account is None:
-        # Not in the local allowlist: never forward to WeKnora, or the
-        # console would be an open password-testing proxy.
-        return JSONResponse({"error": "该邮箱不在本地账号档案（accounts.json）中"},
-                            status_code=403)
-    try:
-        upstream = await _login_upstream(email, password)
-    except LoginError as exc:
-        return JSONResponse({"error": exc.message}, status_code=exc.status_code)
-    token = upstream.get("token") or ""
-    if not token:
-        return JSONResponse({"error": "WeKnora 登录响应中没有 token"}, status_code=502)
-    user = upstream.get("user") or {}
-    tenant = upstream.get("active_tenant") or {}
-    tenant_id = str(user.get("tenant_id") or tenant.get("id") or "")
-    return JSONResponse({
-        "profile": {
-            "name": account["name"],
-            "email": email,
-            "user_id": str(user.get("id") or ""),
-            "tenant_id": tenant_id,
-        },
-        "token": token,
-    })
+def _response_status(result: dict) -> int:
+    return 401 if result.get("http_status") == 401 or result.get("error_code") in {
+        "UNAUTHORIZED", "USER_TOKEN_EXPIRED", "INVALID_USER_TOKEN", "USER_IDENTITY_REQUIRED"
+    } else 200
 
 
 # --- MCP raw JSON-RPC ------------------------------------------------------
@@ -356,34 +220,69 @@ async def _mcp_rpc(method: str, params: dict, user_headers: dict[str, str],
         except urllib.error.HTTPError as exc:
             return {"_http_status": exc.code,
                     "_body": exc.read().decode("utf-8", "ignore")[:500]}
-        if raw.startswith("event:"):
-            for line in raw.splitlines():
-                if line.startswith("data:"):
-                    raw = line[len("data:"):].strip()
-                    break
+        # MCP may use SSE even for a single request; take its JSON-RPC frame.
+        if raw.lstrip().startswith(("event:", "data:", ":")):
+            frames = []
+            for frame in raw.replace("\r\n", "\n").split("\n\n"):
+                data = "\n".join(line[5:].lstrip() for line in frame.splitlines()
+                                 if line.startswith("data:"))
+                if data:
+                    try:
+                        candidate = json.loads(data)
+                    except ValueError:
+                        continue
+                    if isinstance(candidate, dict) and candidate.get("id") == payload["id"]:
+                        frames.append(data)
+            raw = frames[-1] if frames else ""
         try:
             parsed = json.loads(raw)
         except Exception:  # noqa: BLE001
             return {"_http_status": status, "_body": raw[:500]}
+        if not isinstance(parsed, dict):
+            return {"_http_status": status, "_body": "invalid response"}
         parsed["_http_status"] = status
         return parsed
 
-    rpc = await asyncio.to_thread(_do_call)
+    try:
+        rpc = await asyncio.to_thread(_do_call)
+    except Exception as exc:  # upstream exceptions may embed request credentials
+        log.warning("MCP transport failed (%s)", type(exc).__name__)
+        return {"ok": False, "http_status": 502, "error": "MCP transport unavailable"}
     http_status = rpc.get("_http_status", 0)
     if "_body" in rpc and "result" not in rpc:
         return {"ok": False, "http_status": http_status,
-                "error": f"MCP HTTP {http_status}", "raw": rpc.get("_body", "")}
+                "error": f"MCP HTTP {http_status}",
+                "error_code": "UNAUTHORIZED" if http_status == 401 else "MCP_HTTP_ERROR"}
     if "error" in rpc:
         err = rpc["error"] or {}
         return {"ok": False, "http_status": http_status,
-                "error": err.get("message", "rpc error"), "rpc_error": err}
-    decoded = _decode_tool_result(rpc.get("result") or {})
+                "error": "MCP protocol error", "error_code": "MCP_RPC_ERROR",
+                "rpc_error": {"code": err.get("code")}}
+    decoded = _decode_tool_result(_redact_payload(rpc.get("result") or {},
+        [_endpoint_token(), user_headers.get("X-WeKnora-User-Token", "")]))
     out = {"ok": not decoded["is_error"], "http_status": http_status,
            "result": decoded["structured"], "text": decoded["text"]}
     if decoded["is_error"]:
         out["error"] = decoded["error_message"]
         out["error_code"] = decoded["error_code"]
+    if _response_status(out) == 401:
+        out["http_status"] = 401
     return out
+
+
+def _redact_payload(value, secrets):
+    if isinstance(value, dict):
+        return {key: "[redacted]" if key.lower() in {
+            "token", "access_token", "refresh_token", "password", "authorization",
+            "x-weknora-user-token"} else _redact_payload(item, secrets)
+            for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_payload(item, secrets) for item in value]
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[redacted]")
+    return value
 
 
 async def _call_tool(name: str, arguments: dict, user_headers: dict[str, str],
@@ -432,6 +331,23 @@ def _brief_args(args) -> str:
     return json.dumps(args, ensure_ascii=False)[:80]
 
 
+def _exception_auth_fields(exc: BaseException) -> dict:
+    """Find SDK transport 401s through nested exception groups without dumping text."""
+    pending, seen = [exc], set()
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        status = getattr(item, "status_code", None) or getattr(item, "code", None)
+        response = getattr(item, "response", None)
+        if status == 401 or getattr(response, "status_code", None) == 401:
+            return {"http_status": 401, "error_code": "UNAUTHORIZED"}
+        pending.extend(getattr(item, "exceptions", ()) or ())
+        pending.extend(child for child in (item.__cause__, item.__context__) if child)
+    return {}
+
+
 async def _stream_agent_chat(question: str, user_headers: dict[str, str]):
     """Run the LangChain agent (the CLI's exact chain) and stream the
     tool trace + final answer as SSE. No login, no JWT cache, no retry.
@@ -442,10 +358,10 @@ async def _stream_agent_chat(question: str, user_headers: dict[str, str]):
         connections = _build_connection(_endpoint_token(), user_headers)
         agent = await build_agent(await _get_model_async(), connections)
     except Exception as exc:  # noqa: BLE001
-        log.exception("chat init failed")
+        log.warning("chat init failed (%s)", type(exc).__name__)
         yield {"data": json.dumps(
-            {"type": "error",
-             "message": f"初始化失败（{type(exc).__name__}）：{exc}",
+            {"type": "error", **_exception_auth_fields(exc),
+             "message": f"初始化失败（{type(exc).__name__}）",
              "hint": "check AGENT_MODEL / AGENT_MODEL_BASE_URL / AGENT_MODEL_API_KEY and MCP headers"},
             ensure_ascii=False)}
         return
@@ -481,9 +397,9 @@ async def _stream_agent_chat(question: str, user_headers: dict[str, str]):
             ensure_ascii=False)}
         return
     except Exception as exc:  # noqa: BLE001
-        log.exception("agent run failed")
+        log.warning("agent run failed (%s)", type(exc).__name__)
         yield {"data": json.dumps(
-            {"type": "error",
+            {"type": "error", **_exception_auth_fields(exc),
              "message": f"运行失败（{type(exc).__name__}），请检查请求头与 WeKnora 端点"},
             ensure_ascii=False)}
         return
@@ -512,22 +428,26 @@ async def chat(request: Request):
 
 # --- direct ask tool (MCP mode) --------------------------------------------
 
-async def _stream_ask(question: str, session_id: str, user_headers: dict[str, str]):
+async def _stream_ask(question: str, session_id: str, user_headers: dict[str, str],
+                      mode: str = ""):
     """One direct `ask` MCP call streamed as SSE. This is the shape the
     main product will use when it wants WeKnora's own answer pipeline
-    rather than letting its own model orchestrate the tools.
+    rather than letting its own model orchestrate the tools. `mode` selects
+    WeKnora's native QA agent when the caller asked for one.
     """
     yield {"data": json.dumps(
         {"type": "status", "text": "正在调用 MCP ask 工具…"}, ensure_ascii=False)}
     arguments = {"question": question}
     if session_id:
         arguments["session_id"] = session_id
+    if mode:
+        arguments["mode"] = mode
     r = await _call_tool("ask", arguments, user_headers, timeout=ASK_TIMEOUT)
     if not r["ok"]:
         yield {"data": json.dumps(
             {"type": "error",
              "message": r.get("error") or r.get("error_message") or "ask 调用失败",
-             "error_code": r.get("error_code")},
+             "error_code": r.get("error_code"), "http_status": r.get("http_status")},
             ensure_ascii=False)}
         return
     data = r.get("result") or {}
@@ -538,7 +458,9 @@ async def _stream_ask(question: str, session_id: str, user_headers: dict[str, st
          "text": data.get("answer") or "",
          "references": data.get("references") or [],
          "session_id": data.get("session_id") or "",
-         "agent_id": data.get("agent_id") or ""},
+         "agent_id": data.get("agent_id") or "",
+         "mode": data.get("mode") or "",
+         "knowledge_base_ids": data.get("knowledge_base_ids") or []},
         ensure_ascii=False)}
 
 
@@ -552,9 +474,10 @@ async def ask(request: Request):
         return JSONResponse({"error": "request body must be JSON"}, status_code=400)
     question = (body.get("question") or "").strip()
     session_id = (body.get("session_id") or "").strip()
+    mode = (body.get("mode") or "").strip()
     if not question:
         return JSONResponse({"error": "question is required"}, status_code=400)
-    return EventSourceResponse(_stream_ask(question, session_id, user_headers), ping=15)
+    return EventSourceResponse(_stream_ask(question, session_id, user_headers, mode), ping=15)
 
 
 # --- verification checklist (SSE) ------------------------------------------
@@ -613,7 +536,8 @@ async def _poll_document(knowledge_id: str, headers: dict[str, str],
         r = await _call_tool_retrying_rate_limit(
             "get_document_status", {"knowledge_id": knowledge_id}, headers)
         if not r["ok"]:
-            return {"ok": False, "error": r.get("error"), "result": r.get("result")}
+            return {"ok": False, "error": r.get("error"), "result": r.get("result"),
+                    "http_status": r.get("http_status"), "error_code": r.get("error_code")}
         status = ((r.get("result") or {}).get("status") or {})
         last = status
         parse = status.get("parse_status")
@@ -625,7 +549,7 @@ async def _poll_document(knowledge_id: str, headers: dict[str, str],
         await asyncio.sleep(CHECKLIST_POLL_INTERVAL)
 
 
-async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
+async def _checklist_steps(kb_id: str, knowledge_id: str, upload_id: str,
                             user_headers: dict[str, str]):
     """Walk the read-side MCP tools for one knowledge base + document.
 
@@ -645,10 +569,12 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
         latency = round((time.monotonic() - started) * 1000)
         return r, latency
 
-    def emit(tool, status, latency, summary, raw=None):
+    def emit(tool, status, latency, summary, raw=None, *, result=None):
         return {"data": json.dumps(
             {"type": "step", "tool": tool, "status": status,
-             "latency_ms": latency, "summary": summary, "raw": raw},
+             "latency_ms": latency, "summary": summary, "raw": raw,
+             **{key: result[key] for key in ("http_status", "error_code")
+                if result is not None and result.get(key) is not None}},
             ensure_ascii=False)}
 
     summary = {"pass": 0, "fail": 0, "skip": 0}
@@ -662,13 +588,13 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
     if not r["ok"]:
         summary["fail"] += 1
         yield emit("list_knowledge_bases", "fail", latency,
-                   r.get("error") or "调用失败", r.get("result"))
+                   r.get("error") or "调用失败", r.get("result"), result=r)
         yield {"data": json.dumps({"type": "done", "summary": summary}, ensure_ascii=False)}
         return
     if kb is None:
         summary["fail"] += 1
         yield emit("list_knowledge_bases", "fail", latency,
-                   f"知识库 {kb_id} 不在端点范围内", r.get("result"))
+                   f"知识库 {kb_id} 不在端点范围内", r.get("result"), result=r)
         yield {"data": json.dumps({"type": "done", "summary": summary}, ensure_ascii=False)}
         return
     caps = kb.get("capability_flags") or {}
@@ -687,10 +613,10 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
         if r["ok"]:
             summary["pass"] += 1
             yield emit("get_upload_status", "pass", latency,
-                       f"state={(r.get('result') or {}).get('state')}", r.get("result"))
+                       f"state={(r.get('result') or {}).get('state')}", r.get("result"), result=r)
         else:
             summary["fail"] += 1
-            yield emit("get_upload_status", "fail", latency, r.get("error"), r.get("result"))
+            yield emit("get_upload_status", "fail", latency, r.get("error"), r.get("result"), result=r)
     else:
         summary["skip"] += 1
         yield emit("get_upload_status", "skip", 0, "本次流程没有 upload_id（非上传路径）")
@@ -709,7 +635,7 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
             parse_failed = True
             summary["fail"] += 1
             yield emit("get_document_status", "fail", latency,
-                       polled.get("error") or "解析未完成", polled.get("status"))
+                       polled.get("error") or "解析未完成", polled.get("status"), result=polled)
     else:
         parse_failed = True
         summary["skip"] += 1
@@ -731,7 +657,7 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
                        read_result)
         else:
             summary["fail"] += 1
-            yield emit("read_document", "fail", latency, r.get("error"), r.get("result"))
+            yield emit("read_document", "fail", latency, r.get("error"), r.get("result"), result=r)
     else:
         summary["skip"] += 1
         yield emit("read_document", "skip", 0, "解析未完成，跳过")
@@ -743,10 +669,10 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
         if r["ok"]:
             total = (r.get("result") or {}).get("total")
             summary["pass"] += 1
-            yield emit("list_documents", "pass", latency, f"total={total}", r.get("result"))
+            yield emit("list_documents", "pass", latency, f"total={total}", r.get("result"), result=r)
         else:
             summary["fail"] += 1
-            yield emit("list_documents", "fail", latency, r.get("error"), r.get("result"))
+            yield emit("list_documents", "fail", latency, r.get("error"), r.get("result"), result=r)
     else:
         summary["skip"] += 1
         yield emit("list_documents", "skip", 0, "解析未完成，跳过")
@@ -771,10 +697,10 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
             hits = (r.get("result") or {}).get("results") or []
             summary["pass"] += 1
             yield emit(tool, "pass", latency, f"hits={len(hits)} query={query!r}",
-                       r.get("result"))
+                       r.get("result"), result=r)
         else:
             summary["fail"] += 1
-            yield emit(tool, "fail", latency, r.get("error"), r.get("result"))
+            yield emit(tool, "fail", latency, r.get("error"), r.get("result"), result=r)
 
     # 8. get_knowledge_base_status — also yields wiki/graph availability.
     r, latency = await run_step("get_knowledge_base_status", {"knowledge_base_id": kb_id})
@@ -790,7 +716,7 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
     else:
         summary["fail"] += 1
         yield emit("get_knowledge_base_status", "fail", latency,
-                   r.get("error"), r.get("result"))
+                   r.get("error"), r.get("result"), result=r)
 
     # 9-11. wiki tools, two-tier gate: capability flag, then runtime
     # availability from the KB status (a KB can have wiki enabled but
@@ -828,7 +754,7 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
             yield emit(tool, "pass", latency, detail, data)
         else:
             summary["fail"] += 1
-            yield emit(tool, "fail", latency, r.get("error"), r.get("result"))
+            yield emit(tool, "fail", latency, r.get("error"), r.get("result"), result=r)
 
     # wiki_search over the wiki form, and wiki_read_page on a real slug the
     # list above returned — the two wiki tools the other steps cannot cover.
@@ -845,7 +771,7 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
             yield emit("wiki_search", "pass", latency, f"hits={len(hits)}", data)
         else:
             summary["fail"] += 1
-            yield emit("wiki_search", "fail", latency, r.get("error"), r.get("result"))
+            yield emit("wiki_search", "fail", latency, r.get("error"), r.get("result"), result=r)
 
     if wiki_gate:
         summary["skip"] += 1
@@ -864,7 +790,7 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
                        f"slug={wiki_slug} refs={len(refs)}", data)
         else:
             summary["fail"] += 1
-            yield emit("wiki_read_page", "fail", latency, r.get("error"), r.get("result"))
+            yield emit("wiki_read_page", "fail", latency, r.get("error"), r.get("result"), result=r)
 
     # 12. query_knowledge_graph — capability flag + runtime availability.
     if not caps.get("graph"):
@@ -882,19 +808,39 @@ async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
             relations = (r.get("result") or {}).get("relations") or []
             summary["pass"] += 1
             yield emit("query_knowledge_graph", "pass", latency,
-                       f"relations={len(relations)} query={query!r}", r.get("result"))
+                       f"relations={len(relations)} query={query!r}", r.get("result"), result=r)
         elif r.get("error_code") in ("GRAPH_EXTRACTION_NOT_CONFIGURED", "GRAPH_UNAVAILABLE"):
             # Config state, not a tool defect: report as skip with reason.
             summary["skip"] += 1
             yield emit("query_knowledge_graph", "skip", latency,
                        f"配置态：{r.get('error_code')} {r.get('error') or ''}".strip(),
-                       r.get("result"))
+                       r.get("result"), result=r)
         else:
             summary["fail"] += 1
             yield emit("query_knowledge_graph", "fail", latency,
-                       r.get("error"), r.get("result"))
+                       r.get("error"), r.get("result"), result=r)
 
     yield {"data": json.dumps({"type": "done", "summary": summary}, ensure_ascii=False)}
+
+
+async def _checklist_stream(kb_id: str, knowledge_id: str, upload_id: str,
+                            user_headers: dict[str, str]):
+    """Stop the checklist at the first rejected identity and expose its SSE status."""
+    summary = {"pass": 0, "fail": 0, "skip": 0}
+    steps = _checklist_steps(kb_id, knowledge_id, upload_id, user_headers)
+    try:
+        async for frame in steps:
+            event = json.loads(frame["data"])
+            if event.get("type") == "step":
+                summary[event["status"]] += 1
+            yield frame
+            if _response_status(event) == 401:
+                yield {"data": json.dumps({"type": "error", "http_status": 401,
+                    "error_code": "UNAUTHORIZED", "message": "MCP user identity rejected"})}
+                yield {"data": json.dumps({"type": "done", "summary": summary})}
+                return
+    finally:
+        await steps.aclose()
 
 
 async def checklist(request: Request):
@@ -958,8 +904,8 @@ async def upload(request: Request):
             arguments["idempotency_key"] = idem
         r = await _call_tool("upload_file", arguments, user_headers, timeout=120)
         if not r["ok"]:
-            return JSONResponse({"ok": False, "error": r.get("error"), "result": r.get("result")},
-                                status_code=200)
+            return JSONResponse({"ok": False, "error": r.get("error"), "result": r.get("result"),
+                                 "error_code": r.get("error_code")}, status_code=_response_status(r))
         return JSONResponse({"ok": True, "result": r.get("result")})
 
     # --- multipart passthrough ---
@@ -989,13 +935,21 @@ async def upload(request: Request):
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read().decode("utf-8", "ignore")
 
-    status, body_text = await asyncio.to_thread(_forward)
+    try:
+        status, body_text = await asyncio.to_thread(_forward)
+    except Exception as exc:
+        log.warning("MCP upload failed (%s)", type(exc).__name__)
+        return JSONResponse({"ok": False, "error": "MCP upload unavailable"}, status_code=502)
+    if status >= 400:
+        return JSONResponse({"ok": False, "error": f"MCP upload HTTP {status}",
+            "error_code": "UNAUTHORIZED" if status == 401 else "MCP_UPLOAD_ERROR"}, status_code=status)
     try:
         parsed = json.loads(body_text)
     except Exception:  # noqa: BLE001
-        parsed = {"raw": body_text[:500]}
+        parsed = {"ok": False, "error": "Invalid MCP upload response"}
     log.info("multipart upload forwarded: status=%s idempotency=%s", status, idem)
-    return JSONResponse(parsed, status_code=status)
+    return JSONResponse(_redact_payload(parsed,
+        [_endpoint_token(), user_headers.get("X-WeKnora-User-Token", "")]), status_code=status)
 
 
 async def import_upload(request: Request):
@@ -1011,12 +965,14 @@ async def import_upload(request: Request):
     if not kb_id or not upload_id:
         return JSONResponse(
             {"error": "knowledge_base_id and upload_id are required"}, status_code=400)
-    r = await _call_tool("import_document_file",
-                         {"knowledge_base_id": kb_id, "upload_id": upload_id},
-                         user_headers, timeout=120)
+    arguments = {"knowledge_base_id": kb_id, "upload_id": upload_id}
+    process_config = body.get("process_config")
+    if process_config:
+        arguments["process_config"] = process_config
+    r = await _call_tool("import_document_file", arguments, user_headers, timeout=120)
     if not r["ok"]:
         return JSONResponse({"ok": False, "error": r.get("error"),
-                             "error_code": r.get("error_code"), "result": r.get("result")})
+                             "error_code": r.get("error_code"), "result": r.get("result")}, status_code=_response_status(r))
     return JSONResponse({"ok": True, "result": r.get("result")})
 
 
@@ -1030,7 +986,7 @@ async def _simple_tool_route(request: Request, tool: str, argument: str):
     r = await _call_tool(tool, {argument: value}, user_headers)
     if not r["ok"]:
         return JSONResponse({"ok": False, "error": r.get("error"),
-                             "error_code": r.get("error_code"), "result": r.get("result")})
+                             "error_code": r.get("error_code"), "result": r.get("result")}, status_code=_response_status(r))
     return JSONResponse({"ok": True, "result": r.get("result")})
 
 
@@ -1046,6 +1002,24 @@ async def kb_status(request: Request):
     return await _simple_tool_route(request, "get_knowledge_base_status", "knowledge_base_id")
 
 
+async def parser_engines(request: Request):
+    """list_parser_engines through MCP: the deployment's real parser catalog
+    (name, file types, availability). Drives the upload page's parser choice;
+    endpoints that do not expose the tool answer with ok=false and the page
+    falls back to the knowledge base default.
+    """
+    user_headers = _extract_mcp_headers(request)
+    if user_headers is None:
+        return _missing_header_response()
+    r = await _call_tool("list_parser_engines", {}, user_headers)
+    if not r["ok"]:
+        return JSONResponse({"ok": False, "error": r.get("error"),
+                             "error_code": r.get("error_code"),
+                             "http_status": r.get("http_status")},
+                            status_code=_response_status(r))
+    return JSONResponse({"ok": True, "result": r.get("result")})
+
+
 async def kbs(request: Request):
     """list_knowledge_bases through MCP: what can this caller see, and
     which capabilities does each KB have. Drives the KB selector and the
@@ -1057,7 +1031,7 @@ async def kbs(request: Request):
     r = await _call_tool("list_knowledge_bases", {}, user_headers)
     if not r["ok"]:
         return JSONResponse({"ok": False, "error": r.get("error"),
-                             "error_code": r.get("error_code")}, status_code=200)
+                             "error_code": r.get("error_code"), "http_status": r.get("http_status")}, status_code=_response_status(r))
     return JSONResponse({"ok": True, "result": r.get("result")})
 
 
@@ -1068,7 +1042,7 @@ async def tools(request: Request):
         return _missing_header_response()
     r = await _mcp_rpc("tools/list", {}, user_headers)
     if not r["ok"]:
-        return JSONResponse({"ok": False, "error": r.get("error")}, status_code=200)
+        return JSONResponse({"ok": False, "error": r.get("error"), "error_code": r.get("error_code")}, status_code=_response_status(r))
     listed = (r.get("result") or {}).get("tools") or []
     out = []
     for item in listed:
@@ -1112,54 +1086,102 @@ async def run_tool(request: Request):
         "error_code": r.get("error_code"),
         "latency_ms": latency,
         "http_status": r.get("http_status"),
-    })
+    }, status_code=_response_status(r))
 
 
 async def endpoint_info(request: Request):
-    """Read-only endpoint metadata for the header badge.
-
-    Uses the caller's own JWT against the WeKnora management API (the
-    endpoints list is Viewer-readable). Falls back to env-derived facts
-    so an expired token degrades to a hint, not an error page.
-    """
+    """Safe local endpoint facts plus the caller's actual MCP tool catalog."""
     user_headers = _extract_mcp_headers(request)
     if user_headers is None:
         return _missing_header_response()
     base, endpoint_id = _mcp_endpoint_target()
-    fallback = {"ok": False, "endpoint_id": endpoint_id, "mcp_url": base,
-                "error": "管理接口不可读（token 过期或无权限）"}
+    result = await _mcp_rpc("tools/list", {}, user_headers)
+    if not result["ok"]:
+        return JSONResponse(result, status_code=_response_status(result))
+    listed = (result.get("result") or {}).get("tools") or []
+    return JSONResponse({"ok": True, "endpoint_id": endpoint_id,
+        "name": os.environ.get("WEKNORA_AGENT_ENDPOINT_NAME", endpoint_id),
+        "mcp_url": f"{base}/mcp/{endpoint_id}",
+        "tools": [item["name"] for item in listed if isinstance(item, dict) and item.get("name")]})
 
-    def _do() -> tuple[int, str]:
-        import urllib.error
-        import urllib.request
-        req = urllib.request.Request(f"{base}/api/v1/mcp-endpoints/{endpoint_id}")
-        req.add_header("Authorization",
-                       "Bearer " + user_headers.get("X-WeKnora-User-Token", ""))
-        req.add_header("X-Tenant-ID", user_headers.get("X-Tenant-ID", ""))
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                return resp.status, resp.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read().decode("utf-8", "ignore")
 
-    status, raw = await asyncio.to_thread(_do)
-    if status != 200:
-        return JSONResponse(fallback)
+# --- local credential file (demo convenience, explicitly opted in) ----------
+
+# The workbench does not log in and never sees a password. Credentials are
+# issued by the standalone WeKnora utility (issue_user_token.py), which writes
+# one JSON file; this endpoint only *reads* that file so the page can offer a
+# one-click "读取本机凭证" instead of pasting a JWT by hand. The file stays the
+# single source of truth and is never modified here.
+#
+# The convenience is an explicit opt-in: without WEKNORA_CREDENTIAL_FILE the
+# endpoint reports "not configured" and there is NO default sibling-repo path,
+# so a copied Agent checkout cannot silently read another checkout's JWT.
+# Responses are same-machine only (Host check), not cacheable, and never
+# include the file path.
+CREDENTIAL_FILE_ENV = "WEKNORA_CREDENTIAL_FILE"
+
+_NO_STORE = {"Cache-Control": "no-store"}
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+def _local_credential_path() -> Path | None:
+    configured = os.environ.get(CREDENTIAL_FILE_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return None
+
+
+def _same_machine_host(authority: str) -> bool:
+    host = (authority or "").split(":", 1)[0].strip("[]").lower()
+    return host in _LOCAL_HOSTS
+
+
+async def local_credential(request: Request):
+    path = _local_credential_path()
+    if path is None:
+        return JSONResponse({
+            "available": False,
+            "hint": "本机凭证读取未启用：设置 WEKNORA_CREDENTIAL_FILE 指向签发工具的输出文件。",
+        }, status_code=404, headers=_NO_STORE)
+    # Same-machine gate: a page served from another origin must not be able to
+    # read this machine's JWT, even though binding to 127.0.0.1 already limits
+    # who can connect.
+    host = (request.headers.get("host") or "").split(":", 1)[0].strip("[]").lower()
+    if host not in _LOCAL_HOSTS:
+        return JSONResponse({"available": False,
+                             "hint": "本机凭证读取仅限 127.0.0.1 / localhost 访问"},
+                            status_code=403, headers=_NO_STORE)
+    origin = request.headers.get("origin") or ""
+    if origin:
+        origin_host = urllib.parse.urlsplit(origin).hostname or ""
+        if origin_host not in _LOCAL_HOSTS:
+            return JSONResponse({"available": False,
+                                 "hint": "来源不是本机页面"},
+                                status_code=403, headers=_NO_STORE)
     try:
-        data = (json.loads(raw).get("data") or {})
-    except Exception:  # noqa: BLE001
-        return JSONResponse(fallback)
-    return JSONResponse({
-        "ok": True,
-        "endpoint_id": endpoint_id,
-        "name": data.get("name"),
-        "require_user_identity": bool(data.get("require_user_identity")),
-        "enabled": bool(data.get("enabled")),
-        "tools": data.get("tools") or [],
-        "knowledge_base_ids": data.get("knowledge_base_ids") or [],
-        "rate_limit_per_minute": data.get("rate_limit_per_minute"),
-        "token_hint": data.get("token_hint"),
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return JSONResponse({
+            "available": False,
+            "hint": "还没有本机凭证文件。先在终端运行一次 scripts/refresh-credential.ps1，再点这里读取。",
+        }, headers=_NO_STORE)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"available": False,
+                             "hint": f"凭证文件无法读取：{type(exc).__name__}"}, headers=_NO_STORE)
+    token = str(payload.get("token") or "").strip()
+    if not token:
+        return JSONResponse({"available": False, "hint": "凭证文件里没有 Token，请重新生成。"},
+                            headers=_NO_STORE)
+    response = JSONResponse({
+        "available": True,
+        "credential": {
+            "token": token,
+            "expires_at": payload.get("expires_at") or "",
+            "profile": payload.get("profile") or {},
+        },
     })
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # --- page metadata + index + healthz ---------------------------------------
@@ -1172,7 +1194,7 @@ async def info(request: Request):
         "mcp_url": os.environ.get("WEKNORA_MCP_URL", ""),
         "endpoint_id": endpoint_id,
         "knowledge_bases": len(kbs_env),
-        "accounts_available": bool(_load_accounts()),
+        "default_email": "15918868657@163.com",
     })
 
 
@@ -1192,9 +1214,9 @@ def build_app() -> Starlette:
     return Starlette(routes=[
         Route("/", index),
         Route("/api/info", info),
-        Route("/api/accounts", accounts),
-        Route("/api/login", login, methods=["POST"]),
+        Route("/api/local-credential", local_credential),
         Route("/api/kbs", kbs),
+        Route("/api/parser-engines", parser_engines),
         Route("/api/tools", tools),
         Route("/api/tool", run_tool, methods=["POST"]),
         Route("/api/endpoint", endpoint_info),

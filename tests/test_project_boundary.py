@@ -1,26 +1,6 @@
-"""Project boundary contract.
-
-The shell is a deliberate, documented expansion of the prototype
-surface: main.py and agent.py remain the only production entry points
-that drive the agent, but webapp.py is now also part of the shipped
-artifact. The test enforces the residual boundary:
-
-  * The agent runtime is still just main.py + agent.py.
-  * The HTTP shell is a thin layer that proxies user-supplied identity
-    headers to the MCP client; it does NOT depend on a Web framework
-    package directly (the Web framework packages below are listed for
-    the shell). Starlette / sse-starlette / uvicorn are required by
-    webapp.py by construction; this test only allows them and does
-    not pretend they are not there.
-  * The shell does not pull in any other Web framework package. If a
-    later change introduces fastapi / flask / aiohttp server / etc,
-    this assertion fires.
-
-History: the original prototype had only main.py + agent.py and
-disallowed these packages directly. The web shell restored them
-because the user explicitly asked for a thin Web UI on top of the
-standard MCP agent. The contract below keeps the agent clean while
-acknowledging the shell.
+"""Only main.py, agent.py and the thin webapp.py compose the Agent runtime.
+User credential issuance belongs to an external WeKnora utility; every Agent
+knowledge operation crosses the MCP boundary with caller-supplied identity.
 """
 import re
 from pathlib import Path
@@ -69,33 +49,9 @@ def test_runtime_requirements_have_no_unauthorised_web_application_packages():
     assert not found, f"unauthorised web framework packages: {sorted(found)}"
 
 
-def test_webapp_login_proxy_is_allowlisted_and_stateless():
-    """The shell may run a login proxy, but only under two hard limits.
-
-    2026-10-14 the user explicitly asked the console to offer an account
-    dropdown (demo friction), overriding the earlier "the shell never logs
-    in" rule. The boundary that replaces it: credentials live ONLY in the
-    gitignored accounts.json (never in code, never as env names), the shell
-    refuses emails outside that file (so it cannot act as an open login
-    proxy), and the user identity still comes from the request header on
-    every single call — the JWT is returned to the browser and never cached
-    server-side.
-    """
-    webapp = (ROOT / "webapp.py").read_text(encoding="utf-8")
-    # The allowlist file is the only credential source.
-    assert "accounts.json" in webapp
-    # No credentials baked into code or read from demo env names.
-    for token in ("WEKNORA_DEMO_EMAIL", "WEKNORA_DEMO_PASSWORD", "login_for_token"):
-        assert token not in webapp, (
-            f"webapp.py must not carry credentials or the old identity proxy ({token!r})"
-        )
-    # Identity remains request-scoped: the header contract is untouched.
-    assert "X-WeKnora-User-Token" in webapp
-    # A fresh token is handed back to the caller, not kept.
-    assert '"token": token' in webapp
-
-
-def test_accounts_file_is_gitignored_and_example_is_shipped():
-    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
-    assert "accounts.json" in gitignore
-    assert (ROOT / "accounts.json.example").exists()
+def test_production_runtime_has_only_mcp_access_and_external_identity():
+    for name in ("main.py", "agent.py", "webapp.py"):
+        source = (ROOT / name).read_text(encoding="utf-8")
+        for forbidden in ("accounts.json", "/api/v1/", "_login_upstream", "sqlite3", "import redis", "import neo4j"):
+            assert forbidden not in source, f"{name} violates runtime boundary: {forbidden}"
+    assert "X-WeKnora-User-Token" in (ROOT / "webapp.py").read_text(encoding="utf-8")

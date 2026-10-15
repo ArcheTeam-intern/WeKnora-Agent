@@ -2,11 +2,12 @@
 "use strict";
 
 (function () {
-  const { S, api, sse, toast, confirmDialog, renderMarkdown, escapeHtml, mcpHeaders } = window.App;
+  const { S, api, sse, toast, confirmDialog, renderMarkdown, escapeHtml, mcpHeaders,
+          captureIdentityEpoch, isCurrentIdentityEpoch } = window.App;
 
   /* ===================== 视图一：资料与解析验证 ===================== */
   const M = {
-    file: null, channel: "multipart", receipt: null, doc: null,
+    file: null, channel: "tool", receipt: null, doc: null,
     steps: [], summary: null, mounted: false,
   };
 
@@ -18,23 +19,19 @@
     });
   }
 
-  function materialsMount(section) {
+function materialsMount(section) {
     section.innerHTML = `
       <div class="card">
-        <h3><span class="step-no">1</span>上传文档（双通道）</h3>
-        <div class="sub">默认走 <b>multipart 上传端点</b>（/mcp/&lt;id&gt;/uploads，验证传输契约：字段顺序、Idempotency-Key、错误码透传）；
-        可切换 <b>upload_file 工具</b>（base64 纯 MCP 通道）。</div>
+        <h3><span class="step-no">1</span>上传你的资料</h3>
+        <div class="sub">文件上传到「目标知识库」——本次上传、导入与状态查询只作用于它。上传通道只决定字节如何送达 WeKnora，解析方式在下一步单独选择。</div>
         <div class="row">
-          <div class="seg" id="m-channel">
-            <button data-ch="multipart" class="on">multipart 上传端点</button>
-            <button data-ch="tool">upload_file 工具</button>
-          </div>
-        </div>
-        <div class="row">
-          <label class="field grow"><span>目标知识库</span><select id="m-kb" class="input"></select></label>
-          <label class="field"><span>Idempotency-Key（UUID）</span>
-            <input id="m-idem" class="input mono" style="width:320px" autocomplete="off"></label>
-          <button id="m-idem-gen" class="btn ghost small">生成</button>
+          <label class="field grow"><span>目标知识库（本次上传目标）</span>
+            <select id="m-kb" class="input"></select></label>
+          <label class="field"><span>上传通道</span>
+            <div class="seg" id="m-channel">
+              <button data-ch="tool" class="on">标准 MCP 工具</button>
+              <button data-ch="multipart">文件流（兼容）</button>
+            </div></label>
         </div>
         <div class="row">
           <div id="m-drop" class="dropzone grow">
@@ -50,51 +47,33 @@
           <span id="m-upload-status" class="status-line"></span>
         </div>
         <div id="m-receipt"></div>
+        <details class="token-help"><summary>高级：上传请求标识（同 key 同字节幂等重放）</summary>
+          <div class="row" style="margin-top:8px">
+            <input id="m-idem" class="input mono grow" autocomplete="off">
+            <button id="m-idem-gen" class="btn ghost small">生成</button>
+          </div>
+        </details>
       </div>
 
       <div class="card">
-        <h3><span class="step-no">2</span>导入并解析</h3>
-        <div class="sub">import_document_file 原子领取上传回执并触发解析；成功后会立即自动运行验证清单（清单内含解析状态轮询）。</div>
+        <h3><span class="step-no">2</span>解析方式</h3>
+        <div class="sub">选项来自本部署真实的解析引擎目录（MCP <span class="mono">list_parser_engines</span>）。默认沿用知识库配置；
+        若与既有文档内容相同被去重，会复用旧解析结果，本次选项不会重新应用。</div>
+        <div class="row">
+          <label class="field grow"><span>解析引擎</span><select id="m-engine" class="input"></select></label>
+        </div>
+        <div class="row"><span id="m-engine-note" class="kv"></span></div>
+      </div>
+
+      <div class="card">
+        <h3><span class="step-no">3</span>导入并解析</h3>
+        <div class="sub">由 WeKnora 完成解析与索引：状态轮询 → 读取原文 → 检索核对，结果与所用引擎都会显示在下方。</div>
         <div class="row">
           <button id="m-import" class="btn" disabled>导入</button>
           <span class="kv">document：<b id="m-doc" class="mono">–</b></span>
         </div>
         <div class="row"><span id="m-import-status" class="status-line"></span></div>
-      </div>
-
-      <div class="card">
-        <h3><span class="step-no">3</span>MCP 验证清单</h3>
-        <div class="sub">一次上传把读侧工具全验一遍：状态轮询 → read_document → list_documents → 检索 → Wiki → 图谱 → 知识库状态。
-        按 KB 能力自动跳过不适用项；<b>红叉 = 工具失败</b>，跳过永远带原因（配置态不会伪装成失败）。</div>
-        <div class="row">
-          <button id="m-run-checklist" class="btn ghost">运行 / 重跑清单</button>
-          <span id="m-summary" class="status-line"></span>
-          <span class="grow"></span>
-          <button id="m-download" class="btn ghost" disabled>下载清单 JSON</button>
-        </div>
-        <div id="m-checklist"><div class="empty">上传并导入后自动运行；也可先点「运行 / 重跑清单」验证已有文档。</div></div>
-      </div>
-
-      <div class="card">
-        <h3><span class="step-no">4</span>写工具：add / update / delete_document</h3>
-        <div class="sub">破坏性操作会二次确认；update/delete 仅对 Markdown 文档生效。删除时需输入文档标题确认。</div>
-        <div class="row">
-          <label class="field"><span>操作</span>
-            <select id="m-op" class="input select">
-              <option value="add_document">add_document</option>
-              <option value="update_document">update_document</option>
-              <option value="delete_document">delete_document</option>
-            </select></label>
-          <label class="field grow"><span>knowledge_id（update / delete 必填）</span>
-            <input id="m-op-id" class="input mono" autocomplete="off"></label>
-        </div>
-        <div class="row"><label class="field grow"><span>标题（add 必填；update 留空保留原标题）</span>
-          <input id="m-op-title" class="input"></label></div>
-        <div class="row"><label class="field grow"><span>Markdown 内容（add / update 必填）</span>
-          <textarea id="m-op-content" class="input" rows="4"></textarea></label></div>
-        <div class="row"><button id="m-op-run" class="btn">执行</button>
-          <span id="m-op-status" class="status-line"></span></div>
-        <div id="m-op-result"></div>
+        <div id="m-doc-status"></div>
       </div>
     `;
 
@@ -105,6 +84,13 @@
         section.querySelectorAll("#m-channel button").forEach(b => b.classList.toggle("on", b === btn));
       };
     });
+
+    // --- 目标知识库（单选框，与顶栏只读摘要联动）---
+    section.querySelector("#m-kb").onchange = e => {
+      S.uploadTargetKbId = e.target.value;
+      saveScope();
+      renderScopeSummary();
+    };
 
     // --- 文件选择 / 拖拽 ---
     const drop = section.querySelector("#m-drop");
@@ -128,11 +114,19 @@
       section.querySelector("#m-idem").value = uuid4();
     };
 
+    // --- 解析引擎选择 ---
+    section.querySelector("#m-engine").onchange = e => {
+      M.engine = e.target.value;
+      renderEngineNote(section);
+    };
+    renderEngineNote(section);
+
     // --- 上传 ---
     section.querySelector("#m-upload").onclick = async () => {
+      const epoch = captureIdentityEpoch();
       const st = section.querySelector("#m-upload-status");
       const kb = section.querySelector("#m-kb").value;
-      if (!window.App.activeProfile()) { toast("请先登录", "err"); return; }
+      if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
       if (!kb) { st.textContent = "请选择目标知识库"; st.classList.add("err"); return; }
       if (!M.file) { st.textContent = "请选择文件"; st.classList.add("err"); return; }
       const idem = section.querySelector("#m-idem").value.trim();
@@ -143,11 +137,13 @@
       fd.append("knowledge_base_id", kb);
       fd.append("file", M.file, M.file.name);
       const path = `/api/upload?channel=${encodeURIComponent(M.channel)}`;
+      const headers = Object.assign(materialsHeaders(), idem ? { "Idempotency-Key": idem } : {});
       const r = await api(path, {
-        method: "POST", body: fd,
-        headers: idem ? { "Idempotency-Key": idem } : {},
+        method: "POST", body: fd, headers,
         brief: `上传 ${M.file.name}`,
       });
+      // 旧身份的上传回执不得写进新身份的面板。
+      if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
       const d = r.data || {};
       // 两条通道的回执形状：multipart={success,data:{...}}；tool={ok,result:{...}}
       const receipt = d.data || d.result || null;
@@ -164,16 +160,23 @@
       section.querySelector("#m-import-status").textContent = "";
     };
 
-    // --- 导入 ---
+    // --- 导入（带上解析方式）---
     section.querySelector("#m-import").onclick = async () => {
+      const epoch = captureIdentityEpoch();
       const st = section.querySelector("#m-import-status");
       if (!M.receipt) { st.textContent = "请先上传"; st.classList.add("err"); return; }
       st.classList.remove("err");
       st.textContent = "导入中（import_document_file）…";
+      const args = { knowledge_base_id: M.receipt.kb, upload_id: M.receipt.upload_id };
+      const engine = section.querySelector("#m-engine").value;
+      if (engine && engine !== "__default__") {
+        const ext = (String(M.receipt.file_name || "").split(".").pop() || "pdf").toLowerCase();
+        args.process_config = { parser_engine_rules: [{ file_types: [ext], engine }] };
+      }
       const r = await api("/api/import", {
-        method: "POST", json: { knowledge_base_id: M.receipt.kb, upload_id: M.receipt.upload_id },
-        brief: "import_document_file",
+        method: "POST", json: args, headers: materialsHeaders(), brief: "import_document_file",
       });
+      if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
       const res = (r.data && r.data.result) || {};
       const doc = res.document || {};
       if (!r.ok || !(r.data && r.data.ok)) {
@@ -183,88 +186,20 @@
       }
       M.doc = { id: doc.id || res.document_id || "", title: doc.title || "" };
       section.querySelector("#m-doc").textContent = M.doc.id || "–";
-      section.querySelector("#m-op-id").value = M.doc.id || "";
-      st.textContent = `已入队（queued=${res.queued} dedup=${res.deduplicated}）；开始验证清单…`;
-      runChecklist(section);
-    };
-
-    // --- 清单 ---
-    section.querySelector("#m-run-checklist").onclick = () => runChecklist(section);
-    section.querySelector("#m-download").onclick = () => {
-      const payload = {
-        generated_at: new Date().toISOString(),
-        endpoint: (S.endpoint && S.endpoint.endpoint_id) || "",
-        knowledge_base_id: (M.receipt && M.receipt.kb) || section.querySelector("#m-kb").value,
-        knowledge_id: (M.doc && M.doc.id) || "",
-        upload_id: (M.receipt && M.receipt.upload_id) || "",
-        summary: M.summary, steps: M.steps,
-      };
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `mcp-checklist-${Date.now()}.json`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-    };
-
-    // --- 写工具 ---
-    section.querySelector("#m-op").onchange = () => {
-      const op = section.querySelector("#m-op").value;
-      section.querySelector("#m-op-content").closest(".row").classList.toggle("hidden", op === "delete_document");
-      section.querySelector("#m-op-title").closest(".row").classList.toggle("hidden", op === "delete_document");
-    };
-    section.querySelector("#m-op-run").onclick = async () => {
-      const st = section.querySelector("#m-op-status");
-      const op = section.querySelector("#m-op").value;
-      const kb = section.querySelector("#m-kb").value;
-      const id = section.querySelector("#m-op-id").value.trim();
-      const title = section.querySelector("#m-op-title").value.trim();
-      const content = section.querySelector("#m-op-content").value;
-      let args;
-      if (op === "add_document") {
-        if (!kb || !title || !content) { st.textContent = "add 需要 目标库 + 标题 + 内容"; st.classList.add("err"); return; }
-        args = { knowledge_base_id: kb, title, content };
-      } else if (op === "update_document") {
-        if (!id || !content) { st.textContent = "update 需要 knowledge_id + 内容"; st.classList.add("err"); return; }
-        args = { knowledge_id: id, content };
-        if (title) args.title = title;
-      } else {
-        if (!id) { st.textContent = "delete 需要 knowledge_id"; st.classList.add("err"); return; }
-        const okGo = await confirmDialog({
-          title: "删除文档", danger: true, confirmText: "永久删除", typed: title || undefined,
-          message: `将通过 MCP delete_document 删除：\n${id}\n${title ? "（输入标题以确认）" : "该操作不可撤销。"}`,
-        });
-        if (!okGo) return;
-        args = { knowledge_id: id };
-      }
-      if (op !== "delete_document") {
-        const okGo = await confirmDialog({
-          title: `执行 ${op}`, message: `将经 MCP 调用 ${op}：\n${JSON.stringify(args, null, 2).slice(0, 600)}`,
-        });
-        if (!okGo) return;
-      }
-      st.classList.remove("err");
-      st.textContent = "执行中…";
-      const r = await api("/api/tool", { method: "POST", json: { name: op, arguments: args }, brief: op });
-      const d = r.data || {};
-      st.textContent = d.ok ? `成功（${d.latency_ms}ms）` : `失败：${d.error || r.error || r.status}`;
-      if (!d.ok) st.classList.add("err");
-      const box = section.querySelector("#m-op-result");
-      box.innerHTML = "";
-      const pre = document.createElement("pre");
-      pre.className = "raw small";
-      pre.textContent = JSON.stringify(d, null, 2);
-      box.appendChild(pre);
-      if (d.ok && op === "add_document") {
-        const newId = ((d.result || {}).document || {}).id || "";
-        if (newId) section.querySelector("#m-op-id").value = newId;
-      }
+      const applied = res.process_config_applied;
+      st.textContent = `已入队（queued=${res.queued} dedup=${res.deduplicated}` +
+        (applied === undefined ? "" : ` · 解析选项${applied ? "已提交" : "未重新应用"}`) + "）";
+      if (res.note && applied === false) st.textContent += " — " + res.note;
+      pollDocStatus(section);
     };
 
     M.mounted = true;
+    M.engine = M.engine || "__default__";
     syncKbSelect(section);
+    syncEngineSelect(section);
   }
 
+  // syncKbSelect 绑定「上传目标」单选框：它只影响资料页的请求范围。
   function syncKbSelect(section) {
     const sel = section.querySelector("#m-kb");
     if (!sel) return;
@@ -275,9 +210,78 @@
       o.value = kb.id; o.textContent = kb.name;
       sel.appendChild(o);
     }
-    if (prev && S.kbs.some(k => k.id === prev)) sel.value = prev;
-    else if (S.selection.length) sel.value = S.selection[0];
+    const target = S.uploadTargetKbId || prev;
+    if (target && S.kbs.some(k => k.id === target)) sel.value = target;
+    else if (S.kbs.length) { sel.value = S.kbs[0].id; S.uploadTargetKbId = S.kbs[0].id; saveScope(); }
   }
+
+  // syncEngineSelect 渲染解析引擎目录（含不可用原因），默认「使用知识库默认」。
+  function syncEngineSelect(section) {
+    const sel = section.querySelector("#m-engine");
+    if (!sel) return;
+    const prev = M.engine || sel.value || "__default__";
+    sel.innerHTML = "";
+    const def = document.createElement("option");
+    def.value = "__default__";
+    def.textContent = "使用知识库默认";
+    sel.appendChild(def);
+    for (const engine of S.engines || []) {
+      const o = document.createElement("option");
+      o.value = engine.name;
+      const types = (engine.file_types || []).join("/");
+      o.textContent = engine.available
+        ? `${engine.name}${types ? " · " + types : ""}`
+        : `${engine.name}（不可用：${engine.unavailable_reason || "未配置"}）`;
+      o.disabled = !engine.available;
+      sel.appendChild(o);
+    }
+    sel.value = [...sel.options].some(o => o.value === prev && !o.disabled) ? prev : "__default__";
+    M.engine = sel.value;
+    renderEngineNote(section);
+  }
+
+  function renderEngineNote(section) {
+    const note = section.querySelector("#m-engine-note");
+    if (!note) return;
+    const chosen = M.engine && M.engine !== "__default__" ? M.engine : "";
+    const info = (S.engines || []).find(e => e.name === chosen);
+    if (!chosen) {
+      note.textContent = S.engines.length
+        ? `可选引擎 ${S.engines.filter(e => e.available).length} 个（当前使用知识库默认）`
+        : "解析引擎目录不可用：端点未开放 list_parser_engines，将使用知识库默认";
+    } else {
+      note.textContent = `将以 ${chosen} 解析${info && info.file_types ? "（支持 " + info.file_types.join("/") + "）" : ""}；仅对本次导入生效`;
+    }
+  }
+
+  // pollDocStatus 轮询解析状态并回显 requested / applied 引擎，导入后可见。
+  async function pollDocStatus(section) {
+    const box = section.querySelector("#m-doc-status");
+    const docId = M.doc && M.doc.id;
+    if (!box || !docId) return;
+    const epoch = captureIdentityEpoch();
+    box.innerHTML = "";
+    for (let i = 0; i < 40; i++) {
+      const r = await api(`/api/document_status?knowledge_id=${encodeURIComponent(docId)}`,
+        { headers: materialsHeaders(), brief: "get_document_status" });
+      if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+      const status = ((r.data || {}).result || {}).status || {};
+      const requested = Array.isArray(status.requested_parser_engine_rules) && status.requested_parser_engine_rules.length
+        ? status.requested_parser_engine_rules.map(x => `${(x.file_types || []).join("/")}→${x.engine}`).join("; ")
+        : "知识库默认";
+      const div = document.createElement("div");
+      div.className = "kv";
+      div.textContent = `解析：${status.parse_status || "?"} · 索引：${status.index_status || "?"}` +
+        ` · 请求引擎：${requested}` +
+        (status.applied_parser_engine ? ` · 实际引擎：${status.applied_parser_engine}` : "") +
+        (status.error_message ? ` · 错误：${status.error_message}` : "");
+      box.innerHTML = "";
+      box.appendChild(div);
+      if (["completed", "failed", "cancelled"].includes(status.parse_status)) return;
+      await new Promise(res => setTimeout(res, 3000));
+    }
+  }
+
 
   function renderReceipt(section) {
     const box = section.querySelector("#m-receipt");
@@ -294,9 +298,11 @@
   }
 
   async function runChecklist(section) {
-    const kb = (M.receipt && M.receipt.kb) || section.querySelector("#m-kb").value;
+    const epoch = captureIdentityEpoch();
+    const kb = (M.receipt && M.receipt.kb) || S.uploadTargetKbId ||
+      (section.querySelector("#m-kb") ? section.querySelector("#m-kb").value : "");
     if (!kb) { toast("请选择目标知识库", "err"); return; }
-    if (!window.App.activeProfile()) { toast("请先登录", "err"); return; }
+    if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
     const body = { knowledge_base_id: kb };
     if (M.doc && M.doc.id) body.knowledge_id = M.doc.id;
     if (M.receipt) body.upload_id = M.receipt.upload_id;
@@ -311,6 +317,8 @@
     let idx = 0;
     try {
       await sse("/api/checklist", body, evt => {
+        // 身份已切换：清单的后续步骤与 DOM 一律丢弃（sse() 也会停止投递）。
+        if (!isCurrentIdentityEpoch(epoch)) return;
         if (evt.type === "step") {
           idx += 1;
           M.steps.push(evt);
@@ -343,48 +351,136 @@
         }
       });
     } catch (e) {
+      if (!isCurrentIdentityEpoch(epoch)) return;
       toast("清单运行失败：" + e.message, "err");
     } finally {
+      if (!isCurrentIdentityEpoch(epoch)) return;
       const p = table.querySelector("#m-cl-progress");
       if (p) p.classList.remove("cursor");
     }
   }
 
   /* ===================== 视图二：问答 ===================== */
-  const Q = { mode: "ask", sessionId: "", busy: false, mounted: false };
+// Q.scopeAll/qbIds/mode 由 app.js 的状态渲染；exec entry 单独是 LangChain。
+  const Q = { exec: "native", sessionId: "", busy: false, mounted: false };
+
+  function qaScopeChips(section) {
+    const box = section.querySelector("#qa-kbs");
+    if (!box) return;
+    box.innerHTML = "";
+    if (!window.App.activeProfile()) {
+      box.innerHTML = '<span class="muted">配置有效 Token 后加载知识库</span>';
+      return;
+    }
+    const all = document.createElement("span");
+    all.className = "chip" + (S.qaScopeAll ? " on" : "");
+    all.textContent = "全部可用（不额外收窄）";
+    all.title = "显式选择此项时不发送知识库范围头，按端点权限检索全部可见库";
+    all.onclick = () => { S.qaScopeAll = !S.qaScopeAll; saveScope(); setQaScopeChanged(section); };
+    box.appendChild(all);
+    for (const kb of S.kbs) {
+      const on = !S.qaScopeAll && S.qaKbIds.includes(kb.id);
+      const chip = document.createElement("span");
+      chip.className = "chip" + (on ? " on" : "");
+      chip.textContent = kb.name;
+      chip.title = kb.id;
+      chip.onclick = () => {
+        if (S.qaScopeAll) S.qaScopeAll = false;
+        S.qaKbIds = on ? S.qaKbIds.filter(id => id !== kb.id) : S.qaKbIds.concat([kb.id]);
+        saveScope();
+        setQaScopeChanged(section);
+      };
+      box.appendChild(chip);
+    }
+  }
+
+  // 问答范围/模式一变：开新会话、推进 qaEpoch（旧回答不得写回新范围）。
+  function setQaScopeChanged(section) {
+    window.App.advanceQaEpoch();
+    qaScopeChips(section);
+    renderScopeSummary();
+    renderQaScopeLine(section);
+    updateQaSendState(section);
+    const label = section.querySelector("#qa-session");
+    if (label) label.textContent = "–";
+    const msgs = section.querySelector("#qa-msgs");
+    if (msgs) msgs.innerHTML = '<div class="empty">已按新的问答范围开启新会话。</div>';
+  }
+
+  function renderQaScopeLine(section) {
+    const line = section.querySelector("#qa-scope-line");
+    if (!line) return;
+    const nameOf = id => (S.kbs.find(k => k.id === id) || {}).name || id.slice(0, 8);
+    if (S.qaScopeAll) line.textContent = "检索范围：全部可用知识库（不额外收窄）";
+    else if (S.qaKbIds.length) line.textContent = "检索范围：" + S.qaKbIds.map(nameOf).join("、");
+    else line.textContent = "检索范围：未选择 —— 请先选择至少一个知识库（或选择「全部可用」）";
+  }
+
+  function qaScopeChosen() {
+    return S.qaScopeAll || S.qaKbIds.length > 0;
+  }
+
+  function updateQaSendState(section) {
+    const send = section.querySelector("#qa-send");
+    const input = section.querySelector("#qa-q");
+    if (!send) return;
+    const ready = qaScopeChosen() && !!window.App.activeProfile();
+    send.disabled = !ready || Q.busy;
+    if (input) input.placeholder = ready
+      ? "输入问题，Enter 发送（Shift+Enter 换行）"
+      : "先选择问答知识库范围再提问";
+  }
 
   function qaMount(section) {
     section.innerHTML = `
       <div class="card">
         <div class="row">
-          <div class="seg" id="qa-mode">
-            <button data-mode="ask" class="on">ask 工具（MCP 直连）</button>
-            <button data-mode="agent">LangChain Agent（多工具编排）</button>
-          </div>
+          <label class="field grow"><span>检索知识库范围（问答页独立于资料页上传目标）</span>
+            <div id="qa-kbs" class="chips"></div></label>
+        </div>
+        <div class="row"><span id="qa-scope-line" class="kv"></span></div>
+      </div>
+      <div class="card">
+        <div class="row">
+          <label class="field grow"><span>WeKnora 原生问答模式</span>
+            <div class="seg" id="qa-mode">
+              <button data-mode="" class="on">端点默认</button>
+              <button data-mode="quick-answer">原生快速问答</button>
+              <button data-mode="smart-reasoning">原生智能推理</button>
+            </div></label>
           <span class="grow"></span>
           <span class="kv">session：<b id="qa-session" class="mono">–</b></span>
           <button id="qa-new" class="btn ghost small">新会话</button>
         </div>
-        <div class="sub" id="qa-hint">ask = 一次 MCP 调用，走 WeKnora 自己的回答管线并返回 references 引用卡片；
-        agent = 模型自主挑选多个 MCP 工具（浏览器顶栏的 KB 选择生效）。</div>
+        <div class="sub" id="qa-hint">模式经 MCP <span class="mono">ask</span> 的 mode 参数提交，由 WeKnora 校验生效；
+        「端点默认」使用端点配置的 agent。以下「LangChain 验证链」是独立入口，与原生模式二选一。</div>
+        <div class="row">
+          <label class="kv" style="display:flex;gap:6px;align-items:center">
+            <input type="checkbox" id="qa-langchain"> 使用 LangChain 验证链（独立开发验证入口，非 WeKnora 原生模式）
+          </label>
+        </div>
       </div>
-      <div id="qa-msgs"><div class="empty">还没有对话。在下面输入问题开始验证。</div></div>
+      <div id="qa-msgs"><div class="empty">还没有对话。选择范围后输入问题开始。</div></div>
       <div class="card">
         <div class="row">
-          <textarea id="qa-q" class="input grow" rows="2" placeholder="输入问题，Enter 发送（Shift+Enter 换行）"></textarea>
-          <button id="qa-send" class="btn">发送</button>
+          <textarea id="qa-q" class="input grow" rows="2" placeholder="先选择问答知识库范围再提问"></textarea>
+          <button id="qa-send" class="btn" disabled>发送</button>
         </div>
       </div>`;
 
     section.querySelectorAll("#qa-mode button").forEach(btn => {
       btn.onclick = () => {
-        Q.mode = btn.dataset.mode;
+        S.qaMode = btn.dataset.mode || "";
+        saveScope();
         section.querySelectorAll("#qa-mode button").forEach(b => b.classList.toggle("on", b === btn));
-        section.querySelector("#qa-hint").textContent = Q.mode === "ask"
-          ? "ask = 一次 MCP 调用，走 WeKnora 自己的回答管线并返回 references 引用卡片。"
-          : "agent = 模型自主挑选多个 MCP 工具（浏览器顶栏的 KB 选择生效）。";
+        setQaScopeChanged(section);
       };
     });
+    section.querySelector("#qa-langchain").onchange = e => {
+      Q.exec = e.target.checked ? "langchain" : "native";
+      section.querySelectorAll("#qa-mode button").forEach(b => { b.disabled = e.target.checked; });
+      setQaScopeChanged(section);
+    };
     section.querySelector("#qa-new").onclick = () => {
       Q.sessionId = "";
       section.querySelector("#qa-session").textContent = "–";
@@ -395,17 +491,59 @@
     input.addEventListener("keydown", e => {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); qaAsk(section); }
     });
+    // 初始渲染：范围 chips、模式按钮、会话状态
+    section.querySelectorAll("#qa-mode button").forEach(b => {
+      b.classList.toggle("on", (b.dataset.mode || "") === (S.qaMode || ""));
+      b.disabled = Q.exec === "langchain";
+    });
+    section.querySelector("#qa-langchain").checked = Q.exec === "langchain";
+    qaScopeChips(section);
+    renderQaScopeLine(section);
+    updateQaSendState(section);
     Q.mounted = true;
+  }
+
+  // stripThinking removes the model's reasoning wrapper from a final answer:
+  // MiniMax-style vendors inline  thinking… into the content channel and
+  // it must never be shown as the user-facing answer.
+  function stripThinking(text) {
+    return String(text || "")
+      .replace(/<think[\s\S]*?<\/think>/gi, "")
+      .replace(/<thinking[\s\S]*?<\/thinking>/gi, "")
+      .trim();
+  }
+
+  // renderCitations converts the answer's <kb doc="…" chunk_id="…" kb_id="…"/>
+  // markers into readable citation chips and reports which knowledge ids were
+  // actually cited, so the reference list can mark cited vs candidate sources.
+  function renderCitations(text) {
+    const citedKnowledge = new Set();
+    const citedChunks = new Set();
+    const cleaned = String(text || "").replace(
+      /<kb\s+([^>]*?)\/?>/gi,
+      (match, attrs) => {
+        const doc = (attrs.match(/doc="([^"]*)"/) || [])[1] || "";
+        const chunk = (attrs.match(/chunk_id="([^"]*)"/) || [])[1] || "";
+        const kbId = (attrs.match(/kb_id="([^"]*)"/) || [])[1] || "";
+        if (kbId) citedKnowledge.add(kbId);
+        if (chunk) citedChunks.add(chunk);
+        const label = doc || (chunk ? chunk.slice(0, 8) : "来源");
+        return ` ⟦引用: ${label}⟧`;
+      });
+    return { text: cleaned, citedKnowledge, citedChunks };
   }
 
   async function qaAsk(section) {
     if (Q.busy) return;
-    if (!window.App.activeProfile()) { toast("请先登录", "err"); return; }
+    const identityEpoch = captureIdentityEpoch();
+    const scopeEpoch = window.App.captureQaEpoch();
+    if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
+    if (!qaScopeChosen()) { toast("请先选择问答知识库范围（或「全部可用」）", "err"); return; }
     const input = section.querySelector("#qa-q");
     const question = input.value.trim();
     if (!question) return;
     Q.busy = true;
-    section.querySelector("#qa-send").disabled = true;
+    updateQaSendState(section);
     const msgs = section.querySelector("#qa-msgs");
     if (msgs.querySelector(".empty")) msgs.innerHTML = "";
 
@@ -426,39 +564,51 @@
     const refsEl = aiRow.querySelector(".refs");
     msgs.scrollTop = msgs.scrollHeight;
 
+    const stale = () => !isCurrentIdentityEpoch(identityEpoch) || !window.App.isCurrentQaEpoch(scopeEpoch);
     const finish = () => {
+      if (stale()) return;
       statusEl.classList.remove("cursor");
       if (!answerEl.textContent.trim() && !statusEl.textContent.trim()) statusEl.remove();
       Q.busy = false;
-      section.querySelector("#qa-send").disabled = false;
+      updateQaSendState(section);
     };
 
     try {
-      if (Q.mode === "ask") {
-        await sse("/api/ask", { question, session_id: Q.sessionId || undefined }, evt => {
+      if (Q.exec === "native") {
+        const payload = { question, session_id: Q.sessionId || undefined };
+        if (S.qaMode) payload.mode = S.qaMode;
+        await sse("/api/ask", payload, evt => {
+          if (stale()) return;
           if (evt.type === "status") statusEl.textContent = evt.text;
           else if (evt.type === "answer") {
             statusEl.remove();
-            answerEl.innerHTML = renderMarkdown(evt.text || "（空回答）");
+            const answer = stripThinking(evt.text);
+            const rendered = renderCitations(answer);
+            answerEl.innerHTML = renderMarkdown(rendered.text);
+            const meta = [];
+            if (evt.mode) meta.push(`模式 ${evt.mode}`);
+            if (Array.isArray(evt.knowledge_base_ids) && evt.knowledge_base_ids.length) {
+              meta.push(`范围 ${evt.knowledge_base_ids.length} 库`);
+            }
+            if (meta.length) {
+              const badge = document.createElement("div");
+              badge.className = "kv";
+              badge.textContent = meta.join(" · ");
+              refsEl.appendChild(badge);
+            }
             if (evt.session_id) {
               Q.sessionId = evt.session_id;
               section.querySelector("#qa-session").textContent = evt.session_id.slice(0, 12) + "…";
             }
-            for (const ref of evt.references || []) {
-              const card = document.createElement("div");
-              card.className = "ref-card";
-              card.innerHTML = `<div class="t">${escapeHtml(ref.knowledge_title || ref.title || "引用")}</div>
-                <div>${escapeHtml((ref.excerpt || "").slice(0, 220))}</div>
-                <div class="meta">chunk ${escapeHtml(String(ref.chunk_id || "").slice(0, 12))}… · score ${ref.score ?? "-"}</div>`;
-              refsEl.appendChild(card);
-            }
+            attachmentsForRefs(refsEl, evt.references || [], rendered);
           } else if (evt.type === "error") {
             statusEl.textContent = evt.message || "调用失败";
             statusEl.classList.add("err");
           }
-        });
+        }, window.App.qaHeaders());
       } else {
         await sse("/api/chat", { question }, evt => {
+          if (stale()) return;
           if (evt.type === "status") statusEl.textContent = evt.text;
           else if (evt.type === "tool") {
             statusEl.remove();
@@ -471,23 +621,65 @@
             if (last) last.classList.add("err");
           } else if (evt.type === "answer") {
             if (statusEl.parentNode) statusEl.remove();
-            answerEl.innerHTML = renderMarkdown(evt.text || "");
+            const rendered = renderCitations(stripThinking(evt.text));
+            answerEl.innerHTML = renderMarkdown(rendered.text);
+            attachmentsForRefs(refsEl, [], rendered);
           } else if (evt.type === "error") {
             statusEl.textContent = evt.message || "运行失败";
             statusEl.classList.add("err");
           }
-        });
+        }, window.App.qaHeaders());
       }
     } catch (e) {
-      statusEl.textContent = "连接失败：" + e.message;
-      statusEl.classList.add("err");
+      if (!stale()) {
+        statusEl.textContent = "连接失败：" + e.message;
+        statusEl.classList.add("err");
+      }
     } finally {
       finish();
       msgs.scrollTop = msgs.scrollHeight;
     }
   }
 
-  /* ===================== 视图三：MCP 工具台 ===================== */
+  // attachmentsForRefs renders reference cards, separating the sources the
+  // answer actually cited from the remaining retrieval candidates.
+  function attachmentsForRefs(refsEl, references, rendered) {
+    if (!references || !references.length) return;
+    const cited = [];
+    const candidates = [];
+    for (const ref of references) {
+      const isCited = (ref.knowledge_id && rendered.citedKnowledge.has(ref.knowledge_id)) ||
+        (ref.chunk_id && rendered.citedChunks.has(ref.chunk_id));
+      (isCited ? cited : candidates).push(ref);
+    }
+    const add = (ref, kind) => {
+      const card = document.createElement("div");
+      card.className = "ref-card";
+      const mark = kind === "cited" ? "✓ 已引用" : "候选（未被本次回答引用）";
+      card.innerHTML = `<div class="t">${escapeHtml(ref.knowledge_title || ref.title || "引用")}
+        <span class="muted" style="font-size:11px"> · ${mark}</span></div>
+        <div>${escapeHtml(stripThinking(ref.excerpt || "").slice(0, 220))}</div>
+        <div class="meta">chunk ${escapeHtml(String(ref.chunk_id || "").slice(0, 12))}… · score ${ref.score ?? "-"}</div>`;
+      refsEl.appendChild(card);
+    };
+    cited.forEach(ref => add(ref, "cited"));
+    if (candidates.length) {
+      const details = document.createElement("details");
+      details.innerHTML = `<summary class="muted" style="font-size:12px">另有 ${candidates.length} 条候选资料未被本次回答引用</summary>`;
+      const inner = document.createElement("div");
+      inner.className = "refs";
+      details.appendChild(inner);
+      refsEl.appendChild(details);
+      candidates.forEach(ref => {
+        const card = document.createElement("div");
+        card.className = "ref-card";
+        card.innerHTML = `<div class="t">${escapeHtml(ref.knowledge_title || ref.title || "候选")}</div>
+          <div class="meta">chunk ${escapeHtml(String(ref.chunk_id || "").slice(0, 12))}… · score ${ref.score ?? "-"}</div>`;
+        inner.appendChild(card);
+      });
+    }
+  }
+
   const B = { tool: null, mounted: false, formMode: "form", formInputs: {}, jsonText: "" };
 
   function groupOf(name) {
@@ -502,20 +694,140 @@
 
   function benchMount(section) {
     section.innerHTML = `
+      <div class="card">
+        <h3>开发诊断</h3>
+        <div class="sub">这里放验证与开发用能力：MCP 工具台、验证清单、Markdown 写工具。主流程（上传解析、知识问答）在其余两页。</div>
+      </div>
       <div class="bench">
         <div class="card">
           <h3>工具目录</h3>
-          <div class="sub">来自 MCP <span class="mono">tools/list</span>（登录后加载）。</div>
+          <div class="sub">来自 MCP <span class="mono">tools/list</span>（配置 Token 后加载）。</div>
           <input id="b-filter" class="input wide" placeholder="过滤工具名…">
           <div class="tool-list" id="b-list" style="margin-top:10px"></div>
         </div>
         <div class="card">
           <div id="b-detail"><div class="empty">从左侧选择一个工具</div></div>
         </div>
+      </div>
+      <div class="card">
+        <h3>MCP 验证清单</h3>
+        <div class="sub">对上传目标知识库（或最近导入的文档）跑一遍读侧工具：状态轮询 → read_document → list_documents → 检索 → Wiki → 图谱 → 知识库状态。
+        按 KB 能力自动跳过不适用项；红叉 = 工具失败，跳过永远带原因。</div>
+        <div class="row">
+          <button id="m-run-checklist" class="btn ghost">运行 / 重跑清单</button>
+          <span id="m-summary" class="status-line"></span>
+          <span class="grow"></span>
+          <button id="m-download" class="btn ghost" disabled>下载清单 JSON</button>
+        </div>
+        <div id="m-checklist"><div class="empty">在资料页完成一次导入后自动运行；也可在此直接验证已有文档。</div></div>
+      </div>
+      <div class="card">
+        <h3>写工具：add / update / delete_document</h3>
+        <div class="sub">破坏性操作会二次确认；update/delete 仅对 Markdown 文档生效。删除时需输入文档标题确认。</div>
+        <div class="row">
+          <label class="field"><span>操作</span>
+            <select id="m-op" class="input select">
+              <option value="add_document">add_document</option>
+              <option value="update_document">update_document</option>
+              <option value="delete_document">delete_document</option>
+            </select></label>
+          <label class="field grow"><span>knowledge_id（update / delete 必填）</span>
+            <input id="m-op-id" class="input mono" autocomplete="off"></label>
+        </div>
+        <div class="row"><label class="field grow"><span>标题（add 必填；update 留空保留原标题）</span>
+          <input id="m-op-title" class="input"></label></div>
+        <div class="row"><label class="field grow"><span>Markdown 内容（add / update 必填）</span>
+          <textarea id="m-op-content" class="input" rows="4"></textarea></label></div>
+        <div class="row"><button id="m-op-run" class="btn">执行</button>
+          <span id="m-op-status" class="status-line"></span></div>
+        <div id="m-op-result"></div>
       </div>`;
     section.querySelector("#b-filter").oninput = e => renderToolList(section, e.target.value.trim().toLowerCase());
+    section.querySelector("#m-run-checklist").onclick = () => runChecklist(section);
+    section.querySelector("#m-download").onclick = () => downloadChecklist(section);
+    section.querySelector("#m-op").onchange = () => {
+      const op = section.querySelector("#m-op").value;
+      section.querySelector("#m-op-content").closest(".row").classList.toggle("hidden", op === "delete_document");
+      section.querySelector("#m-op-title").closest(".row").classList.toggle("hidden", op === "delete_document");
+    };
+    section.querySelector("#m-op-run").onclick = () => runWriteTool(section);
     B.mounted = true;
     renderToolList(section, "");
+  }
+
+  // downloadChecklist 导出最近一次清单结果（即用即弃 + 一键下载）。
+  function downloadChecklist(section) {
+    const payload = {
+      generated_at: new Date().toISOString(),
+      endpoint: (S.endpoint && S.endpoint.endpoint_id) || "",
+      knowledge_base_id: (M.receipt && M.receipt.kb) || S.uploadTargetKbId || "",
+      knowledge_id: (M.doc && M.doc.id) || "",
+      upload_id: (M.receipt && M.receipt.upload_id) || "",
+      summary: M.summary, steps: M.steps,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `mcp-checklist-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // runWriteTool 执行 add/update/delete_document（诊断用，带二次确认）。
+  async function runWriteTool(section) {
+    const epoch = captureIdentityEpoch();
+    const st = section.querySelector("#m-op-status");
+    const op = section.querySelector("#m-op").value;
+    const kb = S.uploadTargetKbId;
+    const id = section.querySelector("#m-op-id").value.trim();
+    const title = section.querySelector("#m-op-title").value.trim();
+    const content = section.querySelector("#m-op-content").value;
+    let args;
+    if (op === "add_document") {
+      if (!kb || !title || !content) { st.textContent = "add 需要 上传目标知识库 + 标题 + 内容"; st.classList.add("err"); return; }
+      args = { knowledge_base_id: kb, title, content };
+    } else if (op === "update_document") {
+      if (!id || !content) { st.textContent = "update 需要 knowledge_id + 内容"; st.classList.add("err"); return; }
+      args = { knowledge_id: id, content };
+      if (title) args.title = title;
+    } else {
+      if (!id) { st.textContent = "delete 需要 knowledge_id"; st.classList.add("err"); return; }
+      const okGo = await confirmDialog({
+        title: "删除文档", danger: true, confirmText: "永久删除", typed: title || undefined,
+        message: `将通过 MCP delete_document 删除：
+${id}
+${title ? "（输入标题以确认）" : "该操作不可撤销。"}`,
+      });
+      if (!okGo) return;
+      args = { knowledge_id: id };
+    }
+    if (op !== "delete_document") {
+      const okGo = await confirmDialog({
+        title: `执行 ${op}`, message: `将经 MCP 调用 ${op}：
+${JSON.stringify(args, null, 2).slice(0, 600)}`,
+      });
+      if (!okGo) return;
+    }
+    st.classList.remove("err");
+    st.textContent = "执行中…";
+    const r = await api("/api/tool", {
+      method: "POST", json: { name: op, arguments: args },
+      headers: materialsHeaders(), brief: op,
+    });
+    if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+    const d = r.data || {};
+    st.textContent = d.ok ? `成功（${d.latency_ms}ms）` : `失败：${d.error || r.error || r.status}`;
+    if (!d.ok) st.classList.add("err");
+    const box = section.querySelector("#m-op-result");
+    box.innerHTML = "";
+    const pre = document.createElement("pre");
+    pre.className = "raw small";
+    pre.textContent = JSON.stringify(d, null, 2);
+    box.appendChild(pre);
+    if (d.ok && op === "add_document") {
+      const newId = ((d.result || {}).document || {}).id || "";
+      if (newId) section.querySelector("#m-op-id").value = newId;
+    }
   }
 
   function renderToolList(section, filter) {
@@ -634,6 +946,7 @@
   }
 
   async function runBenchTool(section, box) {
+    const epoch = captureIdentityEpoch();
     const t = B.tool;
     let args;
     if (B.formMode === "json") {
@@ -653,6 +966,7 @@
     st.classList.remove("err");
     st.textContent = "运行中…";
     const r = await api("/api/tool", { method: "POST", json: { name: t.name, arguments: args }, brief: t.name });
+    if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
     const d = r.data || {};
     st.textContent = d.ok ? `成功 · ${d.latency_ms}ms · HTTP ${d.http_status ?? r.status}`
                           : `失败 · ${d.error || r.error || r.status}（${d.error_code || ""}）`;
@@ -674,15 +988,48 @@
   /* ===================== 调度 ===================== */
   const Views = {
     mounted: {},
+    onIdentityChanged() {
+      Object.assign(M, { file: null, channel: "tool", receipt: null, doc: null, steps: [], summary: null, mounted: false });
+      Object.assign(Q, { sessionId: "", busy: false, mounted: false });
+      Object.assign(B, { tool: null, mounted: false });
+      for (const name of ["materials", "qa", "bench"]) document.getElementById("view-" + name).innerHTML = "";
+      this.show(S.ui.view, document.getElementById("view-" + S.ui.view));
+    },
     show(name, section) {
       if (name === "materials" && !M.mounted) materialsMount(section);
       if (name === "qa" && !Q.mounted) qaMount(section);
       if (name === "bench" && !B.mounted) benchMount(section);
       if (name === "bench" && B.mounted) renderToolList(section, "");
-      if (name === "materials") syncKbSelect(section);
+      if (name === "materials") { syncKbSelect(section); syncEngineSelect(section); }
+      if (name === "qa") { qaScopeChips(section); renderQaScopeLine(section); updateQaSendState(section); }
     },
     onSelectionChanged() {
-      if (M.mounted) syncKbSelect(document.getElementById("view-materials"));
+      if (M.mounted) {
+        const materials = document.getElementById("view-materials");
+        syncKbSelect(materials);
+        syncEngineSelect(materials);
+      }
+      if (Q.mounted) {
+        const qa = document.getElementById("view-qa");
+        qaScopeChips(qa);
+        renderQaScopeLine(qa);
+        updateQaSendState(qa);
+      }
+      if (B.mounted) renderToolList(document.getElementById("view-bench"), "");
+    },
+    // resetQaScopeState: 问答范围/模式变化时开启新会话的视图侧动作。
+    resetQaScopeState() {
+      Q.sessionId = "";
+      Q.busy = false;
+      const qa = document.getElementById("view-qa");
+      if (qa) {
+        const label = qa.querySelector("#qa-session");
+        if (label) label.textContent = "–";
+        const msgs = qa.querySelector("#qa-msgs");
+        if (msgs) msgs.innerHTML = '<div class="empty">已按新的问答范围开启新会话。</div>';
+        updateQaSendState(qa);
+      }
+      return true;
     },
   };
   window.Views = Views;

@@ -1,16 +1,5 @@
-"""Route-level tests for the console shell (webapp.py).
-
-The shell's WeKnora calls are monkeypatched at the seams
-(`_login_upstream`, `_mcp_rpc`), so these tests run without the live
-stack and pin the contracts that matter:
-
-  * the identity-header gate on every MCP route,
-  * the login proxy's allowlist (accounts.json only, no open proxy),
-  * destructive tool badges,
-  * the checklist's capability gating (skip WITH reason, never a fake
-    failure) and its abort path when the document failed to parse,
-  * the static assets mount.
-"""
+"""Thin MCP workbench contracts: external credentials, request identity,
+MCP-only endpoint discovery, safe errors, tool status and checklist streaming."""
 import json
 
 import pytest
@@ -42,12 +31,7 @@ def _sse_events(response) -> list[dict]:
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
-    accounts = tmp_path / "accounts.json"
-    accounts.write_text(json.dumps({"accounts": [
-        {"name": "演示", "email": "demo@example.com", "password": "pw"},
-    ]}), encoding="utf-8")
-    monkeypatch.setattr(webapp, "ACCOUNTS_PATH", accounts)
+def client():
     return TestClient(webapp.build_app())
 
 
@@ -78,44 +62,60 @@ def test_discovery_works_before_any_kb_selection_exists(client, monkeypatch):
     assert r.json()["result"]["knowledge_bases"][0]["id"] == "kb-1"
 
 
-# --- accounts + login ------------------------------------------------------
+# --- external credentials / MCP-only metadata ------------------------------
 
-def test_accounts_lists_names_without_passwords(client):
-    r = client.get("/api/accounts")
-    assert r.status_code == 200
-    accounts = r.json()["accounts"]
-    assert accounts == [{"name": "演示", "email": "demo@example.com"}]
-    assert "password" not in json.dumps(accounts)
+@pytest.mark.parametrize("method,path", [("GET", "/api/accounts"),
+    ("POST", "/api/login"), ("POST", "/api/relogin")])
+def test_credential_routes_are_absent(client, method, path):
+    assert client.request(method, path).status_code == 404
 
 
-def test_login_rejects_email_outside_the_allowlist(client):
-    r = client.post("/api/login", json={"email": "stranger@example.com", "password": "x"})
-    assert r.status_code == 403
+def test_info_uses_static_default_profile_without_credentials(client, monkeypatch):
+    monkeypatch.setattr(webapp, "_mcp_endpoint_target", lambda: ("http://localhost:18082", "ep"))
+    body = client.get("/api/info").json()
+    assert body["default_email"] == "15918868657@163.com"
+    assert "accounts_available" not in body
 
 
-def test_login_returns_profile_and_token_without_caching(client, monkeypatch):
-    async def fake_upstream(email, password):
-        assert (email, password) == ("demo@example.com", "pw")
-        return {"token": "fresh-jwt", "user": {"id": "u-1", "tenant_id": 2},
-                "active_tenant": {"id": 2}}
-    monkeypatch.setattr(webapp, "_login_upstream", fake_upstream)
-
-    r = client.post("/api/login", json={"email": "demo@example.com", "password": "pw"})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["token"] == "fresh-jwt"
-    assert body["profile"]["user_id"] == "u-1"
-    assert body["profile"]["tenant_id"] == "2"
-    # The shell must not keep the token: no module state holds it.
-    assert "fresh-jwt" not in json.dumps(webapp.state)
+def test_endpoint_metadata_comes_only_from_mcp_tools_list(client, monkeypatch):
+    monkeypatch.setattr(webapp, "_mcp_endpoint_target", lambda: ("http://localhost:18082", "ep"))
+    async def rpc(method, params, headers, timeout=60):
+        assert method == "tools/list"
+        assert headers == HEADERS
+        return {"ok": True, "result": {"tools": [{"name": "read_document"}]}}
+    monkeypatch.setattr(webapp, "_mcp_rpc", rpc)
+    body = client.get("/api/endpoint", headers=HEADERS).json()
+    assert body["ok"] is True
+    assert body["endpoint_id"] == "ep"
+    assert body["tools"] == ["read_document"]
 
 
-def test_login_surfaces_bad_credentials_as_401(client, monkeypatch):
-    async def fake_upstream(email, password):
-        raise webapp.LoginError(401, "账号或密码错误")
-    monkeypatch.setattr(webapp, "_login_upstream", fake_upstream)
-    r = client.post("/api/login", json={"email": "demo@example.com", "password": "wrong"})
-    assert r.status_code == 401
+def test_browser_identity_overrides_unset_env_without_global_mutation(tmp_path, monkeypatch):
+    config = tmp_path / "mcp.json"
+    config.write_text(json.dumps({"weknora": {"url": "http://localhost/mcp/ep",
+        "transport": "http", "headers": {"X-WeKnora-User-Token": "${WEKNORA_USER_TOKEN}",
+        "X-Tenant-ID": "${WEKNORA_TENANT_ID}",
+        "X-WeKnora-Knowledge-Base-Ids": "${WEKNORA_KB_IDS}"}}}))
+    monkeypatch.setattr(webapp, "ROOT", tmp_path)
+    for name in ("WEKNORA_USER_TOKEN", "WEKNORA_TENANT_ID", "WEKNORA_KB_IDS"):
+        monkeypatch.delenv(name, raising=False)
+    import os
+    before = dict(os.environ)
+    conn = webapp._build_connection("endpoint-secret", IDENTITY_ONLY)["weknora"]
+    assert conn["headers"]["X-WeKnora-User-Token"] == "jwt-test"
+    assert "X-WeKnora-Knowledge-Base-Ids" not in conn["headers"]
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("path", ["/api/kbs", "/api/tools", "/api/endpoint"])
+def test_expired_mcp_identity_returns_401(client, monkeypatch, path):
+    async def fail(*args, **kwargs):
+        return {"ok": False, "http_status": 401, "error": "MCP authentication failed",
+                "error_code": "UNAUTHORIZED"}
+    monkeypatch.setattr(webapp, "_call_tool", fail)
+    monkeypatch.setattr(webapp, "_mcp_rpc", fail)
+    monkeypatch.setattr(webapp, "_mcp_endpoint_target", lambda: ("http://localhost", "ep"))
+    assert client.get(path, headers=HEADERS).status_code == 401
 
 
 # --- tools + generic runner ------------------------------------------------
@@ -255,4 +255,234 @@ def test_assets_are_served(client):
 def test_index_serves_the_console_shell(client):
     r = client.get("/")
     assert r.status_code == 200
-    assert "MCP 验证控制台" in r.text
+    assert "WeKnora" in r.text and "/assets/app.js" in r.text
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [(401, b'jwt-test endpoint-secret password-secret'),
+    (200, b'not-json jwt-test endpoint-secret'),
+    (200, b'{"jsonrpc":"2.0","error":{"code":-32000,"message":"jwt-test endpoint-secret"}}')])
+async def test_rpc_errors_never_echo_identity_or_upstream_body(monkeypatch, status, body):
+    import io
+    import urllib.error
+    import urllib.request
+    monkeypatch.setattr(webapp, "_mcp_endpoint_target", lambda: ("http://localhost", "ep"))
+    monkeypatch.setattr(webapp, "_endpoint_token", lambda: "endpoint-secret")
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return body
+    Response.status = status
+    def urlopen(request, timeout):
+        if status != 200:
+            raise urllib.error.HTTPError(request.full_url, status, "bad", {}, io.BytesIO(body))
+        return Response()
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    result = await webapp._mcp_rpc("tools/list", {}, HEADERS)
+    assert result["ok"] is False
+    assert result["http_status"] == status
+    assert all(secret not in json.dumps(result) for secret in ("jwt-test", "endpoint-secret", "password-secret"))
+    if status == 401:
+        assert result["error_code"] == "UNAUTHORIZED"
+
+
+@pytest.mark.asyncio
+async def test_agent_initialization_error_is_secret_free(monkeypatch, caplog):
+    def fail(*args): raise ValueError("jwt-test password-secret")
+    monkeypatch.setattr(webapp, "_endpoint_token", fail)
+    events = [event async for event in webapp._stream_agent_chat("question", HEADERS)]
+    text = json.dumps(events) + caplog.text
+    assert "jwt-test" not in text
+    assert "password-secret" not in text
+
+
+@pytest.mark.asyncio
+async def test_rpc_decodes_the_matching_sse_response_and_redacts_identity(monkeypatch):
+    import urllib.request
+    monkeypatch.setattr(webapp, "_mcp_endpoint_target", lambda: ("http://localhost", "ep"))
+    monkeypatch.setattr(webapp, "_endpoint_token", lambda: "endpoint-secret")
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self):
+            return b': ping\r\n\r\nevent: message\r\ndata: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_document"}],"token":"jwt-test"}}\r\n\r\n'
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout: Response())
+    result = await webapp._mcp_rpc("tools/list", {}, HEADERS)
+    assert result["ok"] is True
+    assert result["result"]["tools"][0]["name"] == "read_document"
+    assert "jwt-test" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_sdk_401_is_classified_in_error_sse(monkeypatch):
+    class Unauthorized(Exception):
+        status_code = 401
+    def fail(*args): raise ExceptionGroup("SDK request failed", [Unauthorized("jwt-test")])
+    monkeypatch.setattr(webapp, "_endpoint_token", fail)
+    events = [json.loads(event["data"]) async for event in webapp._stream_agent_chat("question", HEADERS)]
+    error = next(event for event in events if event["type"] == "error")
+    assert error["http_status"] == 401
+    assert error["error_code"] == "UNAUTHORIZED"
+    assert "jwt-test" not in json.dumps(events)
+
+
+def test_checklist_route_classifies_initial_mcp_401_before_done(client, monkeypatch):
+    calls = []
+    async def unauthorized(name, arguments, headers, timeout=60):
+        calls.append(name)
+        return {"ok": False, "http_status": 401, "error_code": "UNAUTHORIZED",
+                "error": "MCP HTTP 401"}
+    monkeypatch.setattr(webapp, "_call_tool", unauthorized)
+    events = _sse_events(client.post("/api/checklist", headers=HEADERS,
+        json={"knowledge_base_id": "kb-1", "knowledge_id": "doc-1"}))
+    failure = next(event for event in events if event["type"] == "step")
+    assert failure["http_status"] == 401
+    assert failure["error_code"] == "UNAUTHORIZED"
+    error = next(event for event in events if event["type"] == "error")
+    assert error["http_status"] == 401 and error["error_code"] == "UNAUTHORIZED"
+    assert events.index(error) < next(i for i, event in enumerate(events) if event["type"] == "done")
+    assert events[-1]["summary"]["fail"] == 1
+    assert calls == ["list_knowledge_bases"]
+
+
+@pytest.mark.asyncio
+async def test_document_poll_retains_401_fields_after_processing(monkeypatch):
+    replies = [{"ok": True, "result": {"status": {"parse_status": "processing"}}, "http_status": 200},
+        {"ok": False, "http_status": 401, "error_code": "UNAUTHORIZED", "error": "MCP HTTP 401"}]
+    async def call(*args, **kwargs): return replies.pop(0)
+    monkeypatch.setattr(webapp, "_call_tool", call)
+    monkeypatch.setattr(webapp, "CHECKLIST_POLL_INTERVAL", 0)
+    result = await webapp._poll_document("doc-1", HEADERS)
+    assert result["ok"] is False
+    assert result["http_status"] == 401 and result["error_code"] == "UNAUTHORIZED"
+    assert replies == []
+
+
+def test_checklist_revoked_jwt_during_poll_is_an_auth_error_and_stops(client, monkeypatch):
+    calls = []
+    async def call(name, arguments, headers, timeout=60):
+        calls.append(name)
+        if name == "list_knowledge_bases":
+            return {"ok": True, "result": _kb_payload(wiki=False, graph=False), "http_status": 200}
+        if name == "get_document_status":
+            if calls.count(name) == 1:
+                return {"ok": True, "result": {"status": {"parse_status": "processing"}}, "http_status": 200}
+            return {"ok": False, "http_status": 401, "error_code": "UNAUTHORIZED", "error": "MCP HTTP 401"}
+        return {"ok": True, "result": {}, "http_status": 200}
+    monkeypatch.setattr(webapp, "_call_tool", call)
+    monkeypatch.setattr(webapp, "CHECKLIST_POLL_INTERVAL", 0)
+    events = _sse_events(client.post("/api/checklist", headers=HEADERS,
+        json={"knowledge_base_id": "kb-1", "knowledge_id": "doc-1"}))
+    failure = next(event for event in events if event.get("tool") == "get_document_status")
+    assert failure["http_status"] == 401 and failure["error_code"] == "UNAUTHORIZED"
+    error = next(event for event in events if event["type"] == "error")
+    assert error["http_status"] == 401 and error["error_code"] == "UNAUTHORIZED"
+    assert calls == ["list_knowledge_bases", "get_document_status", "get_document_status"]
+    assert events[-1]["type"] == "done" and events[-1]["summary"]["fail"] == 1
+
+
+# --- local credential file (demo convenience) ------------------------------
+
+def test_local_credential_reads_the_issued_file(client, monkeypatch, tmp_path):
+    credential = tmp_path / "workbench-user-token.local.json"
+    credential.write_text(json.dumps({
+        "profile": {"email": "demo@example.com", "tenant_id": "2", "user_id": "u-1"},
+        "token": "issued-jwt", "expires_at": "2026-10-16T05:15:45Z",
+    }), encoding="utf-8")
+    monkeypatch.setenv("WEKNORA_CREDENTIAL_FILE", str(credential))
+
+    r = client.get("/api/local-credential", headers={"Host": "127.0.0.1:18100"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is True
+    assert body["credential"]["token"] == "issued-jwt"
+    assert body["credential"]["profile"]["tenant_id"] == "2"
+    assert body["credential"]["expires_at"] == "2026-10-16T05:15:45Z"
+    # The file path never leaves the server.
+    assert "source" not in body and "path" not in json.dumps(body)
+
+
+def test_local_credential_missing_file_gives_the_refresh_hint(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("WEKNORA_CREDENTIAL_FILE", str(tmp_path / "missing.json"))
+    r = client.get("/api/local-credential", headers={"Host": "127.0.0.1:18100"})
+    body = r.json()
+    assert r.status_code == 200
+    assert body["available"] is False
+    assert "refresh-credential" in body["hint"]
+    assert r.headers.get("cache-control") == "no-store"
+
+
+def test_local_credential_without_a_token_is_not_available(client, monkeypatch, tmp_path):
+    credential = tmp_path / "empty-token.json"
+    credential.write_text(json.dumps({"profile": {}, "token": ""}), encoding="utf-8")
+    monkeypatch.setenv("WEKNORA_CREDENTIAL_FILE", str(credential))
+    body = client.get("/api/local-credential", headers={"Host": "127.0.0.1:18100"}).json()
+    assert body["available"] is False
+    assert "Token" in body["hint"]
+
+
+def test_local_credential_disabled_without_explicit_opt_in(client, monkeypatch):
+    monkeypatch.delenv("WEKNORA_CREDENTIAL_FILE", raising=False)
+    r = client.get("/api/local-credential", headers={"Host": "127.0.0.1:18100"})
+    assert r.status_code == 404
+    assert "WEKNORA_CREDENTIAL_FILE" in r.json()["hint"]
+
+
+def test_local_credential_refuses_non_local_hosts(client, monkeypatch, tmp_path):
+    credential = tmp_path / "workbench-user-token.local.json"
+    credential.write_text(json.dumps({
+        "profile": {"email": "demo@example.com"}, "token": "issued-jwt",
+    }), encoding="utf-8")
+    monkeypatch.setenv("WEKNORA_CREDENTIAL_FILE", str(credential))
+    for host in ("attacker.invalid", "192.168.1.10:18100"):
+        r = client.get("/api/local-credential", headers={"Host": host})
+        assert r.status_code == 403, host
+        assert r.json()["available"] is False
+
+
+# --- parser engine catalog proxy ------------------------------------------
+
+def test_parser_engines_proxies_the_mcp_catalog(client, monkeypatch):
+    async def fake_call(name, arguments, headers, timeout=60):
+        assert name == "list_parser_engines"
+        return {"ok": True, "http_status": 200, "result": {
+            "engines": [{"name": "builtin", "available": True, "file_types": ["pdf"]}],
+            "docreader_connected": True,
+        }}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.get("/api/parser-engines", headers=HEADERS)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["result"]["engines"][0]["name"] == "builtin"
+
+
+def test_parser_engines_requires_identity(client):
+    assert client.get("/api/parser-engines").status_code == 400
+
+
+def test_import_forwards_process_config(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        seen.update(arguments)
+        return {"ok": True, "http_status": 200, "result": {"accepted": True}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.post("/api/import", headers=HEADERS, json={
+        "knowledge_base_id": "kb-1", "upload_id": "u-1",
+        "process_config": {"parser_engine_rules": [{"file_types": ["pdf"], "engine": "builtin"}]},
+    })
+    assert r.status_code == 200
+    assert seen["process_config"]["parser_engine_rules"][0]["engine"] == "builtin"
+
+
+def test_ask_forwards_the_native_mode(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        seen.update(arguments)
+        return {"ok": True, "http_status": 200, "result": {
+            "answer": "ok", "session_id": "s-1", "mode": "quick-answer", "knowledge_base_ids": ["kb-1"]}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.post("/api/ask", headers=HEADERS, json={"question": "q", "mode": "quick-answer"})
+    assert r.status_code == 200
+    assert seen["mode"] == "quick-answer"
+    assert '"mode": "quick-answer"' in r.text or '"mode":"quick-answer"' in r.text

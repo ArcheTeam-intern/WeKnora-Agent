@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>WeKnora MCP 验证控制台</title>
-<link rel="stylesheet" href="/assets/styles.css">
+<title>WeKnora · 知识工作台</title>
+<link rel="stylesheet" href="/assets/styles.css?v=20261015-6">
 </head>
 <body>
 
@@ -12,23 +12,23 @@
   <div class="brand">
     <div class="brand-mark">WK</div>
     <div>
-      <div class="brand-title">MCP 验证控制台</div>
-      <div class="brand-sub">WeKnora-Agent</div>
+      <div class="brand-title">WeKnora Agent</div>
+      <div class="brand-sub">知识工作台 / MCP</div>
     </div>
   </div>
   <nav class="nav">
     <a href="#/materials" data-route="materials" class="nav-item">
-      <span class="nav-ico">📄</span><span>资料与解析验证</span>
+      <span class="nav-ico">▤</span><span>资料与解析</span><span class="nav-num">01</span>
     </a>
     <a href="#/qa" data-route="qa" class="nav-item">
-      <span class="nav-ico">💬</span><span>问答</span>
+      <span class="nav-ico">◌</span><span>知识问答</span><span class="nav-num">02</span>
     </a>
     <a href="#/bench" data-route="bench" class="nav-item">
-      <span class="nav-ico">🧰</span><span>MCP 工具台</span>
+      <span class="nav-ico">⌘</span><span>开发诊断</span><span class="nav-num">03</span>
     </a>
   </nav>
   <div class="sidebar-foot">
-    <div class="side-note">所有操作经 MCP 完成<br>共 <b id="tool-count">–</b> 个工具</div>
+    <div class="side-note"><span class="live-dot"></span> MCP 连接<br><b id="tool-count">–</b> 个工具 · 业务由 WeKnora 提供</div>
     <button id="trace-toggle" class="btn ghost small">MCP 调用轨迹 <span id="trace-count" class="pill">0</span></button>
   </div>
 </aside>
@@ -36,22 +36,25 @@
 <main class="main">
   <header class="topbar">
     <div class="tb-group">
-      <label class="tb-label">用户</label>
+      <label class="tb-label">当前账号</label>
       <select id="user-select" class="input select"></select>
-      <button id="login-btn" class="btn small">登录 / 切换</button>
+      <button id="login-btn" class="btn small">配置 Token</button>
+      <span id="token-status" class="badge gray">待连接</span>
     </div>
     <div class="tb-group">
       <span id="endpoint-badge" class="badge info" title="MCP 端点（由 .env 固定）">端点加载中…</span>
     </div>
     <div class="tb-group tb-kbs">
-      <label class="tb-label">知识库</label>
-      <div id="kb-chips" class="chips"><span class="muted">登录后自动加载…</span></div>
-      <button id="kb-all" class="btn ghost small">全选</button>
-      <button id="kb-none" class="btn ghost small">清空</button>
+      <label class="tb-label">范围</label>
+      <span id="scope-summary" class="muted" style="font-size:12px">配置有效 Token 后加载知识库</span>
     </div>
   </header>
 
   <div class="content">
+    <div class="page-intro">
+      <div><div class="eyebrow">YOUR KNOWLEDGE, CONNECTED</div><h1 id="page-title">从一份资料开始</h1><p id="page-description">上传、解析、核对原文，让每一次回答都有依据。</p></div>
+      <div class="intro-mark" aria-hidden="true"><span>文件</span><i>→</i><span>知识</span><i>→</i><span>答案</span></div>
+    </div>
     <section id="view-materials" class="view"></section>
     <section id="view-qa" class="view"></section>
     <section id="view-bench" class="view"></section>
@@ -76,7 +79,8 @@
 
 <div id="toasts" class="toasts"></div>
 
-<script src="/assets/app.js"></script>
-<script src="/assets/views.js"></script>
+<script src="/assets/session.js?v=20261015-6"></script>
+<script src="/assets/app.js?v=20261015-6"></script>
+<script src="/assets/views.js?v=20261015-6"></script>
 </body>
 </html>

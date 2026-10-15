@@ -23,7 +23,7 @@ def required_env(name):
     return value
 
 
-def load_connections(path):
+def load_connections(path, *, header_overrides=None):
     # Expand parsed string values, not raw JSON, so quotes/backslashes stay safe.
     def expand(value):
         if isinstance(value, str):
@@ -41,6 +41,17 @@ def load_connections(path):
         raise ConfigurationError("无法读取 MCP 配置，请检查文件路径及 JSON 格式") from exc
     if not isinstance(connections, dict) or not connections:
         raise ConfigurationError("MCP 配置必须是非空的 SDK connections 对象")
+    if header_overrides is not None:
+        # Browser identity replaces config headers before placeholder expansion.
+        # Each parse is independent; neither config nor process env is mutated.
+        conn = connections.get("weknora") or {}
+        headers = dict(conn.get("headers") or {})
+        identity = {"x-weknora-user-token", "x-tenant-id", "x-weknora-knowledge-base-ids"}
+        overridden = {key.lower() for key in header_overrides}
+        headers = {key: value for key, value in headers.items()
+                   if key.lower() not in identity | overridden}
+        headers.update(header_overrides)
+        conn["headers"] = headers
     return expand(connections)
 
 
