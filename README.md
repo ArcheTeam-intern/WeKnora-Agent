@@ -4,7 +4,7 @@
 
 运行代码只有 `main.py`、`agent.py` 和 `webapp.py`（页面在 `web/`）。调用链为配置读取 → `ChatOpenAI` → `MultiServerMCPClient.get_tools()` → `create_agent` → `ainvoke` → 答案。框架负责模型与工具循环，不自建 Agent runtime 或 MCP 协议层。
 
-文档上传、解析、RAG、Wiki、知识图谱、身份权限、任务状态和来源结构均在 WeKnora。资料管理继续使用 WeKnora UI（本机原型地址 `http://127.0.0.1:18180`）。CLI/问答链路只使用只读 MCP 工具；控制台的「工具台」视图会刻意调用全部工具（含 upload/import/add/update/delete 写工具），用于验证主产品将消费的 MCP 封装。
+文档上传、解析、RAG、Wiki、知识图谱、身份权限、任务状态和来源结构均在 WeKnora。资料管理继续使用 WeKnora UI（本机原型地址 `http://127.0.0.1:18180`）。CLI/问答链路只使用只读 MCP 工具；控制台的「开发诊断」视图会刻意调用全部工具（含 upload/import/add/update/delete 写工具），用于验证主产品将消费的 MCP 封装。
 
 ```text
 WeKnora-Agent/
@@ -12,15 +12,15 @@ WeKnora-Agent/
   agent.py
   webapp.py
   web/index.html
-  web/assets/{styles.css,app.js,views.js}
-  accounts.json.example     # 复制为 accounts.json 填真实凭据（accounts.json 已 gitignore）
+  web/assets/{session.js,styles.css,app.js,views.js}
+  scripts/refresh-credential.ps1   # 一条命令签发/刷新本机凭证
   mcp.json
   requirements.txt
   requirements-dev.txt
   .env.example
   README.md
   tests/
-  docs/implementation-plan.md
+  docs/
 ```
 
 使用 Python 3.12+（本机已建立独立 `.venv`）：
@@ -38,25 +38,28 @@ MCP 验证控制台（验证主产品将消费的全部 21 项 MCP 能力）：
 
 ```powershell
 Set-Location E:\GoLandCode\WeKnora-Agent
-Copy-Item accounts.json.example accounts.json   # 填入演示账号（本机文件，已 gitignore）
+powershell -ExecutionPolicy Bypass -File scripts\refresh-credential.ps1   # 一条命令签发/刷新凭证
 .\.venv\Scripts\python.exe webapp.py
 # 打开 http://127.0.0.1:18100 （端口取 WEKNORA_AGENT_WEB_PORT，默认 18100）
 ```
 
+连接工作台只需两步：页面右上角「配置 Token」→ 点「🔄 读取本机凭证」→「连接工作台」。（也可以粘贴 JWT 或导入凭证 JSON；凭据在通过 MCP 校验前不会生效，只保存在当前标签页。）
+
 控制台有三个视图，全部操作经 MCP 完成，右上角「MCP 调用轨迹」抽屉保留每次请求的原始 JSON：
 
-- **资料与解析验证**：上传双通道可切换（multipart `/mcp/:id/uploads` 原样透传，保留字段顺序与 Idempotency-Key；或 `upload_file` 工具 base64 通道）→ `import_document_file` 导入 → 自动跑验证清单（状态轮询 → `read_document` → `list_documents` → 检索 → `wiki_*` → 图谱 → `get_knowledge_base_status`），按知识库 `capability_flags` 与运行时可用性两级门控跳过不适用项，跳过永远带原因；清单结果可下载 JSON。另有 add/update/delete_document 写工具入口（破坏性二次确认）。
-- **问答**：双模可切换。默认直连 MCP `ask` 工具（返回 references 引用卡片，支持 session 续问）；或切到 LangChain Agent 模式（模型自主编排只读工具，展示工具轨迹）。
-- **MCP 工具台**：`tools/list` 全量工具、按 inputSchema 自动生成参数表单（可切 JSON 编辑）、原始请求/响应面板、破坏性工具二次确认。
+- **资料解析**：**上传目标知识库**与**解析引擎**各自独立选择（引擎来自 `list_parser_engines` 的真实目录，不可用的引擎带原因且不可选；「使用知识库默认」即不指定）。上传双通道可切换（`upload_file` 工具 base64 通道，或 multipart `/mcp/:id/uploads` 原样透传）→ `import_document_file` 携带 `process_config` 导入 → 状态行显示「解析/索引/请求引擎/实际引擎」，即 `applied_parser_engine` 与请求的规则对照。
+- **知识问答**：**问答范围**多选知识库（或「全部可用」；未选择时发送按钮禁用）与上传目标互不干扰；**问答模式**可选原生 `ask` 的 `quick-answer` / `smart-reasoning`，或切到 LangChain Agent 模式（模型自主编排只读工具，展示工具轨迹）。切换范围或模式会开启新会话并丢弃旧范围/旧模式在途的回答；同一会话内可带 `session_id` 续问。
+- **开发诊断**：`tools/list` 全量工具（按 inputSchema 自动生成参数表单，可切 JSON 编辑）、原始请求/响应面板、破坏性工具二次确认；验证清单（状态轮询 → `read_document` → `list_documents` → 检索 → `wiki_*` → 图谱 → `get_knowledge_base_status`，按 `capability_flags` 两级门控跳过并注明原因，可下载 JSON）；add/update/delete_document 写工具入口。
 
-登录用 `accounts.json` 里的账号向 WeKnora 换取新鲜 JWT（access token 24 小时过期，控制台不缓存 token，每次都从浏览器请求头转发）。知识库选择是可选的收窄（与 MCP 契约一致：不选=不收窄），顶栏徽章显示端点名称/模式/工具数/KB 范围（经管理接口只读获取）。
+凭证由 WeKnora 验证目录里的独立工具 `issue_user_token.py` 正式签发（access token 24 小时过期）；`scripts/refresh-credential.ps1` 只是它的本机便捷入口，签发后会把新 JWT 同步进 `.env` 供 CLI 使用，并把凭证文件留在标准位置供工作台一键读取（`GET /api/local-credential` 只在显式设置 `WEKNORA_CREDENTIAL_FILE` 且请求来自本机时读取）。工作台自身不做登录、不保存密码、不自动续期；知识库范围是可选的收窄（与 MCP 契约一致：不选=不收窄），顶栏显示当前身份、端点名称/模式/工具数与范围摘要（只读）。
 
-逐个实测全部 MCP 工具（需要真实 WeKnora 栈与 accounts.json）：
+逐个实测全部 MCP 工具（需要真实 WeKnora 栈、新鲜用户 JWT 与显式指定的测试库）：
 
 ```powershell
-$env:WEKNORA_LIVE_MCP=1
+$env:WEKNORA_LIVE_MCP='1'; $env:WEKNORA_TEST_KB='<本轮允许写入的知识库>'
 .\.venv\Scripts\python.exe -m pytest tests/test_live_mcp_tools.py -q -s
-# 每行输出 pass/skip/fail 与证据；wiki/graph 类按能力门控判定，配置态计 skip 不计 fail
+# 每行输出 pass/skip/fail 与证据；写类工具用本轮唯一 uuid 草稿自清；
+# wiki/graph 类按能力门控判定，配置态计 skip 不计 fail
 ```
 
 模型必须支持工具调用及 OpenAI-compatible chat API。更换模型只需改 `AGENT_MODEL`、`AGENT_MODEL_BASE_URL`、`AGENT_MODEL_API_KEY`。

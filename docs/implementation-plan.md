@@ -1,5 +1,7 @@
 # WeKnora MCP 封装与纯 LangChain Agent 验证方案
 
+> **2026-10-14 继续执行入口：** 先读 [剩余工作交接](remaining-work-handoff-2026-10-14.md)，设计细节参照 [纠偏方案](correction-plan-2026-10-14.md)。用户已确认页面使用 WeKnora 现有问答，LangChain Agent 仅验证 MCP。Agent Web／自动登录已在 `cefb0af` 裁剪完成；此文件保留原始方案，其历史状态不能视为当前待办。
+
 > **供执行模型：** 如环境具备技能，按 executing-plans 逐任务实施；第 8 节用勾选步骤跟踪。保持当前纯 Agent 边界，不从归档旧应用方案重新开工。
 
 **目标：** 完成 WeKnora MCP 核心知识链路及能力评估，WeKnora-Agent 仅保留标准 LangChain 与 MCP 配置。
