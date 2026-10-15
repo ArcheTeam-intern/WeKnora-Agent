@@ -73,6 +73,10 @@ a { color: var(--green-dark); }
 .chip:hover { border-color: var(--green); }
 .chip.on { background: var(--green-soft); border-color: var(--green); color: var(--green-dark); font-weight: 600; }
 .chip .caps { font-size: 10.5px; color: var(--muted); }
+/* 示例问题比较长：允许换行、左对齐、占满宽度，别撑破成一颗超长胶囊。 */
+.qa-examples { align-items: flex-start; }
+.qa-examples #qa-examples { flex: 1; }
+.qa-examples .chip { border-radius: 10px; text-align: left; line-height: 1.45; max-width: 100%; }
 .chip.on .caps { color: var(--green-dark); }
 
 /* ---------- 内容区 ---------- */

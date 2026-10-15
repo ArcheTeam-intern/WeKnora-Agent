@@ -195,3 +195,10 @@ PASS  add_document / update_document / delete_document（草稿自清 x2）
 | 写工具与工具目录重复 | 删除重复的写工具卡片，写操作统一在工具目录里跑（带二次确认与示例） |
 
 实测：界面新建知识库成功并自动选中（toast + 列表刷新）；`get_document_status` 的示例自动填入最近文档 id `9bcd6223…` 并成功返回真实状态；问答页选范围后提问返回「林澈」及 `chunk f65bab05…` 引用。验证用的两个演示库已删除，端点范围恢复为原三库、工具数 22。
+
+## 第三轮（演示准备）：示例问题、能力感知示例、可用的全能力演示库
+
+- 问答页新增 5 条示例问题（点一下即填入），覆盖文字页/表格页/扫描页，配套《WeKnora-PDF验收样本-青岚计划》。
+- 图谱/Wiki 工具报 `GRAPH_EXTRACTION_NOT_CONFIGURED` 不是工具坏了，是当时选中的库没开该能力。工具示例现在会**自动挑一个已开启该能力的库**（优先当前上传目标），失败时也会列出哪些库可用。
+- 新建了演示库 **演示库-问答Wiki图谱**（`3daf893b…`）：开启 Wiki + 知识图谱 + OCR，模型继承工作区默认（embedding `c7dd10c9…`、QA `0142cc52…`、VLM `7d5d6380…`），内含验收 PDF（doc `3930c19c…`）。实测：解析/索引/摘要 completed，7 个分块、Wiki 13 页 15 链接、图谱 `query_knowledge_graph` 返回 7 条关系。
+- 起因是两个真实缺陷（已修，见 WeKnora commit）：MCP 建的库不带 embedding/summary/VLM 模型 → 首次导入必然 "model ID cannot be empty"；图谱开启但没配实体/关系类型 → 抽不出任何关系。

@@ -451,7 +451,23 @@ test("a tool example fills real ids from the live workspace", async () => {
   assert.ok(/青岚计划/.test(detail.querySelector("#b-example-note").textContent), "示例说明应指出用的是哪篇文档");
 });
 
-/* ---------------- 9. KB/工具刷新：迟到列表不得写回 ---------------- */
+/* ---------------- 9. 问答示例问题：一点即填入 ---------------- */
+test("the QA page offers example questions that fill the input", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-qa");
+  w.App.S.ui.view = "qa";
+  setIdentity(w, "a@example.com", "token-a");
+  w.App.S.qaKbIds = ["kb-a"];
+  w.Views.show("qa", section);
+
+  // 极简 DOM 不解析 HTML，示例 chips 是代码 appendChild 进来的子元素。
+  const chips = section.querySelector("#qa-examples").children;
+  assert.ok(chips.length >= 3, "应提供几个示例问题：" + chips.length);
+  chips[1].onclick();
+  assert.equal(section.querySelector("#qa-q").value, chips[1].textContent, "点击示例应填入问题");
+});
+
+/* ---------------- 10. KB/工具刷新：迟到列表不得写回 ---------------- */
 test("a late knowledge-base list from A never repopulates B's state", async () => {
   const w = boot();
   setIdentity(w, "a@example.com", "token-a");

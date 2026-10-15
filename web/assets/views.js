@@ -789,6 +789,10 @@ function materialsMount(section) {
           <textarea id="qa-q" class="input grow" rows="2" placeholder="先选择问答知识库范围再提问"></textarea>
           <button id="qa-send" class="btn" disabled>发送</button>
         </div>
+        <div class="row qa-examples">
+          <span class="kv">示例问题（配合《WeKnora-PDF验收样本-青岚计划》这份资料，点一下即填入）：</span>
+          <div class="chips" id="qa-examples"></div>
+        </div>
       </div>`;
 
     section.querySelectorAll("#qa-mode button").forEach(btn => {
@@ -805,6 +809,26 @@ function materialsMount(section) {
       section.querySelector("#qa-msgs").innerHTML = '<div class="empty">已开新会话。</div>';
     };
     const input = section.querySelector("#qa-q");
+    // 示例问题：覆盖文字页、表格页与扫描页，演示时点一下就填好。
+    const EX_QUESTIONS = [
+      "青岚计划的项目编号、资料识别标记、负责人和复核人分别是什么？",
+      "批次 A-17 的合格率是多少？请给出分子、分母与计算过程。",
+      "三个批次分别能否放行？请逐项比较合格率与峰值温度。",
+      "第 3 页扫描交接单的交接口令、箱数和关联批次是什么？",
+      "青岚计划的年度预算是多少？如果资料里没有，请明确说明。",
+    ];
+    const exBox = section.querySelector("#qa-examples");
+    if (exBox) {
+      for (const q of EX_QUESTIONS) {
+        const chip = document.createElement("button");
+        chip.className = "chip";
+        chip.type = "button";
+        chip.textContent = q;
+        chip.title = "点击填入问题";
+        chip.onclick = () => { input.value = q; input.focus(); };
+        exBox.appendChild(chip);
+      }
+    }
     section.querySelector("#qa-send").onclick = () => qaAsk(section);
     input.addEventListener("keydown", e => {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); qaAsk(section); }
@@ -1209,6 +1233,31 @@ function materialsMount(section) {
     return S.uploadTargetKbId || (S.kbs[0] && S.kbs[0].id) || "";
   }
 
+  // exampleKbFor 挑一个真正开启了某项能力的知识库：Wiki / 图谱示例如果落到没
+  // 开该能力的库上，工具必然报「未配置」，那不是工具坏了而是挑错了库。
+  function exampleKbFor(capability) {
+    const kbs = S.kbs || [];
+    const has = k => !!(k.capability_flags || {})[capability];
+    // 当前上传目标如果有这项能力就用它（演示时选中的库优先），否则挑第一个具备该能力的。
+    const target = kbs.find(k => k.id === S.uploadTargetKbId && has(k));
+    return target || kbs.find(has) || null;
+  }
+
+  function capabilityHint(toolName, errorText) {
+    const text = String(errorText || "");
+    const needsGraph = /graph/i.test(toolName) || /GRAPH_/.test(text);
+    const needsWiki = /^wiki_/.test(toolName);
+    if (!needsGraph && !needsWiki) return "";
+    const cap = needsGraph ? "graph" : "wiki";
+    const capable = (S.kbs || []).filter(k => (k.capability_flags || {})[cap]);
+    if (!capable.length) {
+      return `当前可见的知识库里没有开启${cap === "graph" ? "知识图谱" : "Wiki"}的，` +
+        "可在「资料解析」页新建一个（勾选对应能力）并上传资料。";
+    }
+    return `这不是工具坏了：当前范围里没有开启${cap === "graph" ? "知识图谱" : "Wiki"}的库。` +
+      `已开启的有：${capable.map(k => k.name).join("、")}（在「填入示例」里会自动切到它）。`;
+  }
+
   async function exampleNewestDoc(kbId) {
     if (EX.kbId === kbId && EX.docId) return EX;
     const r = await api("/api/tool", {
@@ -1221,11 +1270,23 @@ function materialsMount(section) {
       EX.kbId = kbId;
       EX.docId = picked.id;
       EX.docTitle = picked.title || picked.file_name || "";
-      // 用标题里的一个词做检索示例，比固定词更容易命中。
-      const word = String(EX.docTitle).replace(/\.[a-z]+$/i, "").slice(0, 6);
-      EX.docWord = word || "验收";
+      // 用标题里的一个词做检索示例，比固定词更容易命中：优先取"-/_/. "分隔出的
+      // 最长片段（"WeKnora-PDF验收样本" → "WeKnora"），否则截前 8 个字。
+      const base = String(EX.docTitle).replace(/\.[a-z0-9]+$/i, "");
+      const parts = base.split(/[\s\-_\.]+/).filter(t => t.length >= 2);
+      const longest = parts.sort((a, b) => b.length - a.length)[0] || "";
+      EX.docWord = (longest || base).slice(0, 12);
     }
     return EX;
+  }
+
+  function wikiExampleKb() {
+    const kb = exampleKbFor("wiki");
+    if (!kb) {
+      throw new Error("当前可见的知识库里没有开启 Wiki 的；可在「资料解析」页新建一个" +
+        "（勾选「同时生成 Wiki 页面」）并上传资料，等解析完成后再试");
+    }
+    return kb;
   }
 
   function examplePlainText() {
@@ -1267,22 +1328,42 @@ function materialsMount(section) {
         return { args: Object.assign({ query: EX.docWord || "验收", limit: 5 }, kbList) };
       case "ask":
         return { args: { question: "这个知识库里有哪些资料？请按文档分别说明。", mode: "quick-answer" } };
-      case "wiki_index":
-        return { args: Object.assign({ limit: 20 }, kbArgs) };
-      case "wiki_list_pages":
-        return { args: Object.assign({ page: 1, page_size: 5 }, kbArgs) };
-      case "wiki_read_page":
-        return { args: { slug: "index", knowledge_base_id: kbId },
-                 note: "「index」是每套 Wiki 的入口页；要读别的页面可以先跑 wiki_index 拿 slug" };
-      case "wiki_search":
-        await exampleNewestDoc(kbId);
-        return { args: Object.assign({ query: EX.docWord || "总结", limit: 5 }, kbList) };
-      case "wiki_graph":
-        return { args: Object.assign({ limit: 10 }, kbArgs) };
-      case "query_knowledge_graph":
-        await exampleNewestDoc(kbId);
-        return { args: Object.assign({ query: EX.docWord || "项目" }, kbList),
-                 note: "知识库没开启图谱抽取时，这里会返回空列表（属正常，不是错误）" };
+      case "wiki_index": {
+        const kb = wikiExampleKb();
+        return { args: Object.assign({ limit: 20 }, { knowledge_base_id: kb.id }),
+                 note: `用的是《${kb.name}》（已开启 Wiki）` };
+      }
+      case "wiki_list_pages": {
+        const kb = wikiExampleKb();
+        return { args: Object.assign({ page: 1, page_size: 5 }, { knowledge_base_id: kb.id }),
+                 note: `用的是《${kb.name}》（已开启 Wiki）` };
+      }
+      case "wiki_read_page": {
+        const kb = wikiExampleKb();
+        return { args: { slug: "index", knowledge_base_id: kb.id },
+                 note: `《${kb.name}》的入口页；读别的页面先跑 wiki_index 拿 slug` };
+      }
+      case "wiki_search": {
+        const kb = wikiExampleKb();
+        return { args: Object.assign({ query: EX.docWord || "总结", limit: 5 },
+                                     { knowledge_base_ids: [kb.id] }),
+                 note: `在《${kb.name}》的 Wiki 里检索` };
+      }
+      case "wiki_graph": {
+        const kb = wikiExampleKb();
+        return { args: Object.assign({ limit: 10 }, { knowledge_base_id: kb.id }),
+                 note: `《${kb.name}》的 Wiki 页面关系边` };
+      }
+      case "query_knowledge_graph": {
+        const kb = exampleKbFor("graph");
+        if (!kb) {
+          throw new Error("当前可见的知识库里没有开启知识图谱的；可在「资料解析」页新建一个" +
+            "（勾选「同时抽取知识图谱」）并上传资料，等解析完成后再试");
+        }
+        await exampleNewestDoc(kb.id);
+        return { args: Object.assign({ query: EX.docWord || "项目" }, { knowledge_base_ids: [kb.id] }),
+                 note: `用的是《${kb.name}》（已开启图谱）；刚导入的资料要等解析+抽取完成才有关系` };
+      }
       case "upload_file":
         return { args: { knowledge_base_id: kbId, file_name: "console-demo-" + Date.now() + ".md",
                          content: exampleBase64() },
@@ -1381,7 +1462,11 @@ function materialsMount(section) {
     const d = r.data || {};
     st.textContent = d.ok ? `成功 · 耗时 ${d.latency_ms}ms`
                           : `失败：${d.error || r.error || statusCN(r.status)}${d.error_code ? `（${d.error_code}）` : ""}`;
-    if (!d.ok) st.classList.add("err");
+    if (!d.ok) {
+      st.classList.add("err");
+      const hint = capabilityHint(t.name, `${d.error_code || ""} ${d.error || ""}`);
+      if (hint) st.textContent += " —— " + hint;
+    }
     const pane = box.querySelector("#b-result");
     pane.innerHTML = "";
     const mk = (title, obj) => {
