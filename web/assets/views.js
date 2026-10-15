@@ -85,13 +85,16 @@ function materialsMount(section) {
 
       <div class="card">
         <h3><span class="step-no">3</span>导入并解析</h3>
-        <div class="sub">由 WeKnora 完成解析与索引：状态轮询 → 读取原文 → 检索核对，结果与所用引擎都会显示在下方。</div>
+        <div class="sub">由 WeKnora 完成解析与索引。下面会实时显示解析/索引进度、请求与实际使用的引擎，解析完成后给出分块数与原文预览。</div>
         <div class="row">
           <button id="m-import" class="btn" disabled>导入</button>
           <span class="kv">document：<b id="m-doc" class="mono">–</b></span>
+          <span class="grow"></span>
+          <button id="m-recent" class="btn ghost small">查看知识库最近导入</button>
         </div>
         <div class="row"><span id="m-import-status" class="status-line"></span></div>
         <div id="m-doc-status"></div>
+        <div id="m-recent-list"></div>
       </div>
     `;
 
@@ -184,6 +187,7 @@ function materialsMount(section) {
           M.receipt = Object.assign({ channel: M.channel, kb }, rr);
           st.textContent = "上传成功";
           renderReceipt(section);
+          saveLastImport();
           section.querySelector("#m-import").disabled = false;
           section.querySelector("#m-import-status").textContent = "";
           return;
@@ -224,18 +228,24 @@ function materialsMount(section) {
         return;
       }
       M.doc = { id: doc.id || res.document_id || "", title: doc.title || "" };
+      M.docStartedAt = Date.now();
       section.querySelector("#m-doc").textContent = M.doc.id || "–";
       const applied = res.process_config_applied;
       st.textContent = `已入队（queued=${res.queued} dedup=${res.deduplicated}` +
         (applied === undefined ? "" : ` · 解析选项${applied ? "已提交" : "未重新应用"}`) + "）";
       if (res.note && applied === false) st.textContent += " — " + res.note;
+      saveLastImport();
       pollDocStatus(section);
     };
+
+    // --- 刷新后找回：知识库最近导入的文档 ---
+    section.querySelector("#m-recent").onclick = () => showRecentDocs(section);
 
     M.mounted = true;
     M.engine = M.engine || "__default__";
     syncKbSelect(section);
     syncEngineSelect(section);
+    restoreLastImport(section);
   }
 
   // syncKbSelect 绑定「上传目标」单选框：它只影响资料页的请求范围。
@@ -293,32 +303,209 @@ function materialsMount(section) {
     }
   }
 
+  /* ---- 上次导入记录：刷新页面后仍能找回文档与解析结果 ---- */
+  const LAST_KEY = "wk.materials.last";
+
+  function saveLastImport() {
+    const p = window.App.activeProfile && window.App.activeProfile();
+    if (!p || !M.receipt) return;
+    try {
+      sessionStorage.setItem(LAST_KEY, JSON.stringify({
+        email: p.email, workspace: String(p.tenant_id || ""),
+        receipt: M.receipt, doc: M.doc, engine: M.engine, at: Date.now(),
+      }));
+    } catch (_) { /* 私密模式等场景下写不进去就算了 */ }
+  }
+  function clearLastImport() {
+    try { sessionStorage.removeItem(LAST_KEY); } catch (_) {}
+  }
+  function restoreLastImport(section) {
+    const p = window.App.activeProfile && window.App.activeProfile();
+    let rec = null;
+    try { rec = JSON.parse(sessionStorage.getItem(LAST_KEY) || "null"); } catch (_) { rec = null; }
+    if (!rec || !rec.receipt || !p) return;
+    // 记录只属于写入它的那个身份，换了账号不能复活。
+    if (rec.email !== p.email || String(rec.workspace) !== String(p.tenant_id || "")) return;
+    M.receipt = rec.receipt;
+    M.doc = rec.doc || null;
+    M.docStartedAt = rec.at || null;   // 刷新后「已等待」从原始导入时间继续算
+    if (rec.engine) M.engine = rec.engine;
+    renderReceipt(section);
+    section.querySelector("#m-import").disabled = false;
+    const st = section.querySelector("#m-import-status");
+    st.textContent = "已恢复上次导入记录（刷新前上传/导入的内容），下面显示它当前的状态";
+    if (M.doc && M.doc.id) {
+      section.querySelector("#m-doc").textContent = M.doc.id;
+      pollDocStatus(section);
+    }
+  }
+
+  const STATUS_CN = {
+    pending: "排队中", queued: "排队中", running: "解析中", parsing: "解析中", processing: "解析中",
+    indexing: "索引中", finalizing: "收尾中", summarizing: "生成摘要中",
+    completed: "已完成", success: "已完成", failed: "失败", cancelled: "已取消",
+    disabled: "已停用", empty: "无",
+  };
+  function parseStatusCN(s) {
+    const key = String(s || "").toLowerCase();
+    return STATUS_CN[key] || (s ? String(s) : "未知");
+  }
+  function doneStatus(s) { return ["completed", "failed", "cancelled"].includes(String(s || "").toLowerCase()); }
+
+  // docPollSeq：新的轮询或新的文档会让旧的循环立刻退出，避免两个循环互相覆盖。
+  let docPollSeq = 0;
+
   // pollDocStatus 轮询解析状态并回显 requested / applied 引擎，导入后可见。
   async function pollDocStatus(section) {
     const box = section.querySelector("#m-doc-status");
     const docId = M.doc && M.doc.id;
     if (!box || !docId) return;
+    const seq = ++docPollSeq;
     const epoch = captureIdentityEpoch();
-    box.innerHTML = "";
-    for (let i = 0; i < 40; i++) {
+    // 有原始导入时间就接着它算等待时长（刷新后不清零）。
+    const startedAt = M.docStartedAt || Date.now();
+    M.docStartedAt = startedAt;
+    let preview = M.preview && M.preview.id === docId ? M.preview : null;
+    for (let i = 0; i < 100; i++) {
       const r = await api(`/api/document_status?knowledge_id=${encodeURIComponent(docId)}`,
-        { headers: materialsHeaders(), brief: "get_document_status" });
-      if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+        { headers: materialsHeaders(), brief: getDocTitle() });
+      if (!isCurrentIdentityEpoch(epoch) || r.stale || seq !== docPollSeq) return;
       const status = ((r.data || {}).result || {}).status || {};
-      const requested = Array.isArray(status.requested_parser_engine_rules) && status.requested_parser_engine_rules.length
-        ? status.requested_parser_engine_rules.map(x => `${(x.file_types || []).join("/")}→${x.engine}`).join("; ")
-        : "知识库默认";
-      const div = document.createElement("div");
-      div.className = "kv";
-      div.textContent = `解析：${status.parse_status || "?"} · 索引：${status.index_status || "?"}` +
-        ` · 请求引擎：${requested}` +
-        (status.applied_parser_engine ? ` · 实际引擎：${status.applied_parser_engine}` : "") +
-        (status.error_message ? ` · 错误：${status.error_message}` : "");
-      box.innerHTML = "";
-      box.appendChild(div);
-      if (["completed", "failed", "cancelled"].includes(status.parse_status)) return;
-      await new Promise(res => setTimeout(res, 3000));
+      const done = doneStatus(status.parse_status);
+      if (done && !preview) {
+        preview = await readDocPreview(section, docId, epoch, seq);
+        M.preview = preview ? Object.assign({ id: docId }, preview) : null;
+      }
+      if (seq !== docPollSeq) return;
+      renderDocProgress(section, status, {
+        elapsed: Math.round((Date.now() - startedAt) / 1000),
+        preview, done, timedOut: false,
+      });
+      if (done) return;
+      await new Promise(res => setTimeout(res, i < 5 ? 1500 : 3000));
     }
+    if (seq !== docPollSeq) return;
+    const last = M.lastStatus || {};
+    renderDocProgress(section, last, { elapsed: 300, preview, done: false, timedOut: true });
+  }
+
+  function getDocTitle() {
+    return (M.doc && M.doc.title) || (M.receipt && M.receipt.file_name) || "document status";
+  }
+
+  // readDocPreview 读回解析结果的头一段：分块数 + 原文前 200 字，
+  // 让人一眼看出「解析出什么了」（扫描件没开 OCR 时会明显为空）。
+  async function readDocPreview(section, docId, epoch, seq) {
+    const r = await api("/api/tool", {
+      method: "POST",
+      json: { name: "read_document", arguments: { knowledge_id: docId, limit: 1 } },
+      headers: materialsHeaders(), brief: "读取解析结果",
+    });
+    if (!isCurrentIdentityEpoch(epoch) || r.stale || seq !== docPollSeq) return null;
+    if (!r.ok || !(r.data && r.data.ok)) return { total: null, text: "", error: (r.data && r.data.error) || r.error };
+    const d = (r.data.result) || {};
+    const chunk = (d.chunks || [])[0] || {};
+    return {
+      total: d.total_chunks != null ? d.total_chunks : ((d.document || {}).chunk_count ?? null),
+      fetched: d.fetched_chunks != null ? d.fetched_chunks : null,
+      text: String(chunk.content || "").replace(/\s+/g, " ").trim().slice(0, 200),
+    };
+  }
+
+  // renderDocProgress 把状态画成一块「看得懂」的进度面板。
+  function renderDocProgress(section, status, ctx) {
+    const box = section.querySelector("#m-doc-status");
+    if (!box) return;
+    M.lastStatus = status;
+    const requested = Array.isArray(status.requested_parser_engine_rules) && status.requested_parser_engine_rules.length
+      ? status.requested_parser_engine_rules.map(x => `${(x.file_types || []).join("/")}→${x.engine}`).join("; ")
+      : "知识库默认";
+    const parse = status.parse_status || "?";
+    const idx = status.index_status || "?";
+    const head = ctx.done
+      ? (parse === "completed"
+        ? `✅ 解析完成（${ctx.elapsed}s）· 索引${parseStatusCN(idx)}，可去「知识问答」提问`
+        : `⚠️ 解析${parseStatusCN(parse)}`)
+      : `⏳ 解析中，已等待 ${ctx.elapsed}s（4 页扫描件通常 1–2 分钟）`;
+    const cells = [
+      ["解析", parseStatusCN(parse)],
+      ["索引", parseStatusCN(idx)],
+      ["请求引擎", requested],
+      ["实际引擎", status.applied_parser_engine || "（解析开始后显示）"],
+      ["文件类型", status.file_type || "–"],
+      ["最后更新", String(status.updated_at || status.processed_at || "–").slice(0, 19).replace("T", " ")],
+    ];
+    const previewLine = ctx.preview
+      ? (ctx.preview.error
+        ? `<div class="kv err-text">读取解析结果失败：${escapeHtml(String(ctx.preview.error))}</div>`
+        : `<div class="kv">分块数：<b>${ctx.preview.total != null ? ctx.preview.total : "?"}</b>
+           ${ctx.preview.text ? `· 预览：<span class="dp-quote">${escapeHtml(ctx.preview.text)}…</span>`
+             : "· 这一段没有文字（扫描件需开启 OCR / 图像理解）"}</div>`)
+      : "";
+    box.innerHTML = `
+      <div class="doc-progress">
+        <div class="dp-head">${escapeHtml(head)}</div>
+        <div class="dp-grid">${cells.map(([k, v]) =>
+          `<div class="dp-cell"><span>${escapeHtml(k)}</span><b>${escapeHtml(String(v))}</b></div>`).join("")}</div>
+        ${status.error_message ? `<div class="kv err-text">错误：${escapeHtml(status.error_message)}</div>` : ""}
+        ${ctx.timedOut ? '<div class="kv">等待超过 5 分钟仍在解析，可点下面的「刷新状态」继续看。</div>' : ""}
+        ${previewLine}
+        <div class="dp-actions">
+          <button id="m-status-refresh" class="btn ghost small">刷新状态</button>
+          <button id="m-status-forget" class="btn ghost small">清除这条记录</button>
+        </div>
+      </div>`;
+    box.querySelector("#m-status-refresh").onclick = () => pollDocStatus(section);
+    box.querySelector("#m-status-forget").onclick = () => {
+      docPollSeq++;              // 让在飞的轮询循环退出
+      clearLastImport();
+      M.receipt = null; M.doc = null; M.preview = null;
+      section.querySelector("#m-receipt").innerHTML = "";
+      section.querySelector("#m-doc").textContent = "–";
+      section.querySelector("#m-import-status").textContent = "";
+      section.querySelector("#m-doc-status").innerHTML = "";
+      section.querySelector("#m-import").disabled = true;
+    };
+  }
+
+  // showRecentDocs 兜底：刷新后没记录时，直接看目标知识库里最近导入的文档。
+  async function showRecentDocs(section) {
+    const box = section.querySelector("#m-recent-list");
+    const kb = S.uploadTargetKbId || section.querySelector("#m-kb").value;
+    const epoch = captureIdentityEpoch();
+    if (!kb) { toast("请先选择目标知识库", "err"); return; }
+    box.innerHTML = '<div class="kv">查询中…</div>';
+    const r = await api("/api/tool", {
+      method: "POST",
+      json: { name: "list_documents", arguments: { knowledge_base_id: kb, page_size: 8 } },
+      headers: materialsHeaders(), brief: "列出最近导入",
+    });
+    if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
+    const docs = ((r.data && r.data.result) || {}).documents || [];
+    if (!r.ok || !(r.data && r.data.ok)) {
+      box.innerHTML = `<div class="kv err-text">查询失败：${escapeHtml(String((r.data && r.data.error) || r.error))}</div>`;
+      return;
+    }
+    if (!docs.length) { box.innerHTML = '<div class="kv">这个知识库里还没有文档。</div>'; return; }
+    box.innerHTML = `<div class="kv">最近导入（点一行即可查看它的解析结果）：</div>
+      <div class="recent-docs">${docs.map((d, i) => `
+        <button class="recent-doc" data-i="${i}">
+          <span class="rd-title">${escapeHtml(d.title || d.file_name || d.id)}</span>
+          <span class="rd-meta">${escapeHtml(parseStatusCN(d.parse_status))} · ${escapeHtml(String(d.updated_at || d.created_at || "").slice(0, 19).replace("T", " "))}</span>
+        </button>`).join("")}</div>`;
+    box.querySelectorAll(".recent-doc").forEach(btn => {
+      btn.onclick = () => {
+        const d = docs[Number(btn.dataset.i)];
+        M.receipt = Object.assign({}, M.receipt || {}, { kb });
+        M.doc = { id: d.id, title: d.title || d.file_name || "" };
+        M.preview = null;
+        section.querySelector("#m-doc").textContent = M.doc.id;
+        section.querySelector("#m-import-status").textContent = `正在查看：${M.doc.title || M.doc.id}`;
+        section.querySelector("#m-recent-list").innerHTML = "";
+        saveLastImport();
+        pollDocStatus(section);
+      };
+    });
   }
 
 
@@ -1047,7 +1234,9 @@ ${JSON.stringify(args, null, 2).slice(0, 600)}`,
   const Views = {
     mounted: {},
     onIdentityChanged() {
-      Object.assign(M, { file: null, channel: "tool", receipt: null, doc: null, steps: [], summary: null, mounted: false });
+      Object.assign(M, { file: null, channel: "tool", receipt: null, doc: null, steps: [], summary: null,
+                            mounted: false, preview: null, lastStatus: null, idemAuto: true });
+      docPollSeq++;  // 旧身份的轮询循环立即失效
       Object.assign(Q, { sessionId: "", busy: false, mounted: false });
       Object.assign(B, { tool: null, mounted: false });
       for (const name of ["materials", "qa", "bench"]) document.getElementById("view-" + name).innerHTML = "";

@@ -347,7 +347,71 @@ test("an idempotency conflict is retried once with a fresh key", async () => {
   assert.equal(section.querySelector("#m-import").disabled, false, "重试成功后导入按钮应可用");
 });
 
-/* ---------------- 7. KB/工具刷新：迟到列表不得写回 ---------------- */
+/* ---------------- 7. 资料页：刷新后能找回上次导入并继续看进度 ---------------- */
+test("a refreshed page restores the last import and keeps polling it", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-materials");
+  setIdentity(w, "a@example.com", "token-a");
+  // 模拟「上次会话记录」：真实路径由上传/导入成功时写进 sessionStorage。
+  w.sessionStorage.setItem("wk.materials.last", JSON.stringify({
+    email: "a@example.com", workspace: "2", engine: "__default__",
+    receipt: { channel: "tool", kb: "kb-1", upload_id: "u-1", file_name: "青岚计划.pdf", file_size: 159000, sha256: "abc" },
+    doc: { id: "doc-1", title: "青岚计划.pdf" }, at: Date.now(),
+  }));
+  w.Views.show("materials", section);
+  await flush();
+
+  assert.equal(section.querySelector("#m-doc").textContent, "doc-1", "恢复后应显示上次的文档");
+  assert.ok(/恢复上次导入记录/.test(section.querySelector("#m-import-status").textContent), "应提示这是恢复的记录");
+  assert.equal(section.querySelector("#m-import").disabled, false, "恢复后导入按钮可用（可直接重试）");
+
+  // 恢复后立刻续看状态：应发出一次 document_status 查询。
+  const statusCall = takeCall("/api/document_status");
+  statusCall.resolve(jsonResp(200, { ok: true, result: { status: {
+    parse_status: "running", index_status: "pending", applied_parser_engine: "anydoc",
+    requested_parser_engine_rules: [{ file_types: ["pdf"], engine: "anydoc" }], file_type: "pdf",
+  } } }));
+  await flush();
+  const panel = section.querySelector("#m-doc-status").innerHTML;
+  assert.ok(/解析中/.test(panel), "进度面板应显示中文解析状态：" + panel.slice(0, 120));
+  assert.ok(/anydoc/.test(panel), "面板应显示实际引擎");
+});
+
+test("a finished parse shows the chunk preview in the progress panel", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-materials");
+  setIdentity(w, "a@example.com", "token-a");
+  w.Views.show("materials", section);
+  w.App.S.uploadTargetKbId = "kb-1";
+  section.querySelector("#m-kb").value = "kb-1";
+  const fileInput = section.querySelector("#m-file");
+  fileInput.files = [new File([new Uint8Array([9])], "done.pdf", { type: "application/pdf" })];
+  fileInput.onchange();
+  section.querySelector("#m-upload").onclick();
+  await flush();
+  takeCall("/api/upload").resolve(jsonResp(200, { ok: true, result: { upload_id: "u-9", file_name: "done.pdf" } }));
+  await flush();
+  section.querySelector("#m-import").onclick();
+  await flush();
+  takeCall("/api/import").resolve(jsonResp(200, { ok: true, result: { queued: true, deduplicated: false, document: { id: "doc-9", title: "done.pdf" } } }));
+  await flush();
+
+  takeCall("/api/document_status").resolve(jsonResp(200, { ok: true, result: { status: {
+    parse_status: "completed", index_status: "completed", applied_parser_engine: "default", file_type: "pdf",
+  } } }));
+  await flush();
+  takeCall("/api/tool").resolve(jsonResp(200, { ok: true, result: {
+    total_chunks: 12, fetched_chunks: 1,
+    chunks: [{ content: "青岚计划 QL-2026-417 负责人林澈" }],
+  } }));
+  await flush();
+  const panel = section.querySelector("#m-doc-status").innerHTML;
+  assert.ok(/解析完成/.test(panel), "完成后应给出完成提示");
+  assert.ok(/12/.test(panel), "应显示分块数");
+  assert.ok(/林澈/.test(panel), "应显示解析出的原文预览");
+});
+
+/* ---------------- 8. KB/工具刷新：迟到列表不得写回 ---------------- */
 test("a late knowledge-base list from A never repopulates B's state", async () => {
   const w = boot();
   setIdentity(w, "a@example.com", "token-a");
