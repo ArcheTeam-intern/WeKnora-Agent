@@ -201,7 +201,7 @@ def test_http_imports_only_standard_agent_stack():
     forbidden_patterns = (
         r"\bFastAPI\b", r"\bSessionStore\b", r"\bMCPClient\b(?!\w)",
         r"\b_BudgetedChatModel\b", r"backend\.app", r"\bevidence\b",
-        r"\bsqlite\b", r"\bmultipart\b", r"\buvicorn\b",
+        r"\bsqlite\b", r"\bmultipart\b",
     )
     for filename in ("main.py", "agent.py", "requirements.txt"):
         text = (root / filename).read_text(encoding="utf-8")

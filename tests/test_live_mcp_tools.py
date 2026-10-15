@@ -1,7 +1,7 @@
-"""Live verification of every MCP tool the console can reach.
+r"""Live verification of every MCP tool the console can reach.
 
 Off by default: set WEKNORA_LIVE_MCP=1 to run against the real stack
-(needs a reachable WeKnora + accounts.json). Every tool is called through
+(needs a reachable WeKnora and an externally issued user JWT). Every tool is called through
 the SAME raw JSON-RPC path the console uses (webapp._call_tool), through
 the endpoint's user-mode identity, so a pass here means the main product
 can do the same thing with the same headers.
@@ -14,13 +14,27 @@ Classification for each tool:
   * fail  — anything else; the assertion at the end fails the run
 
 Write tools run against scratch documents created and removed by the
-test itself (add→update→delete, upload→import→delete).
+test itself (add→update→delete, upload→import→delete). Every fixture carries
+a per-run uuid so it can never dedup onto another round's document, and the
+target knowledge base is the EXPLICIT test KB (WEKNORA_TEST_KB, else the
+first entry of WEKNORA_KB_IDS) — the test never auto-picks a KB from
+capability ranking, so it cannot write into a user's business library.
+
+Run with freshly issued credentials in the child environment only::
+
+    $env:WEKNORA_LIVE_MCP = '1'
+    $env:WEKNORA_USER_TOKEN = '<fresh JWT from issue_user_token.py>'
+    $env:WEKNORA_TENANT_ID = '2'
+    $env:WEKNORA_TEST_KB = '<the KB this round may write to>'
+    .\.venv\Scripts\python.exe -m pytest tests/test_live_mcp_tools.py -q -s
+    Remove-Item Env:\WEKNORA_LIVE_MCP, Env:\WEKNORA_USER_TOKEN, Env:\WEKNORA_TENANT_ID, Env:\WEKNORA_TEST_KB
 """
 import asyncio
 import base64
 import json
 import os
 import time
+import uuid
 
 import pytest
 
@@ -54,20 +68,24 @@ class Report:
 
 
 async def _live_headers():
-    accounts = webapp._load_accounts()
-    assert accounts, "accounts.json is required for the live run"
-    creds = accounts[0]
-    upstream = await webapp._login_upstream(creds["email"], creds["password"])
-    token = upstream.get("token") or ""
-    assert token, "live login returned no token"
-    user = upstream.get("user") or {}
-    tenant = str(user.get("tenant_id") or (upstream.get("active_tenant") or {}).get("id") or "")
-    kbs = [k for k in os.environ.get("WEKNORA_KB_IDS", "").split(",") if k.strip()]
-    return {
-        "X-WeKnora-User-Token": token,
-        "X-Tenant-ID": tenant,
-        "X-WeKnora-Knowledge-Base-Ids": ",".join(kbs),
-    }
+    token = os.environ.get("WEKNORA_USER_TOKEN", "").strip()
+    tenant = os.environ.get("WEKNORA_TENANT_ID", "").strip()
+    assert token and tenant, "externally issued WEKNORA_USER_TOKEN and WEKNORA_TENANT_ID are required"
+    headers = {"X-WeKnora-User-Token": token, "X-Tenant-ID": tenant}
+    kbs = os.environ.get("WEKNORA_KB_IDS", "").strip()
+    if kbs:
+        headers["X-WeKnora-Knowledge-Base-Ids"] = kbs
+    return headers
+
+
+def _allowed_test_kb_id() -> str:
+    """The explicitly allowed test KB: WEKNORA_TEST_KB, else the first of
+    WEKNORA_KB_IDS. Never auto-picked from capability ranking."""
+    explicit = os.environ.get("WEKNORA_TEST_KB", "").strip()
+    if explicit:
+        return explicit
+    listed = [k.strip() for k in os.environ.get("WEKNORA_KB_IDS", "").split(",") if k.strip()]
+    return listed[0] if listed else ""
 
 
 async def _pick_kb(headers, report):
@@ -79,15 +97,35 @@ async def _pick_kb(headers, report):
     report.add("list_knowledge_bases", "pass", f"visible_kbs={len(kbs)}")
     if not kbs:
         return None, None
-    # Prefer a KB that exercises the most tools (wiki + graph + retrieval);
-    # ties broken by name length (stable, deterministic pick).
-    def rank(kb):
-        flags = kb.get("capability_flags") or {}
-        return (bool(flags.get("wiki")), bool(flags.get("graph")),
-                bool(flags.get("vector")), bool(flags.get("keyword")),
-                -len(str(kb.get("name"))))
-    kb = sorted(kbs, key=rank, reverse=True)[0]
-    return kb.get("id"), kb
+    wanted = _allowed_test_kb_id()
+    assert wanted, ("WEKNORA_TEST_KB (or the first WEKNORA_KB_IDS entry) is required: "
+                    "the live run must not auto-pick a knowledge base to write to")
+    for kb in kbs:
+        if str(kb.get("id")) == wanted:
+            return kb.get("id"), kb
+    report.add("list_knowledge_bases", "fail",
+               f"测试库 {wanted} 不在可见范围内（用 WEKNORA_TEST_KB 指定本轮允许写入的库）")
+    return None, None
+
+
+async def _await_applied_engine(call, knowledge_id, timeout=90):
+    """Poll get_document_status until the pipeline records what it ran.
+
+    Parsing is asynchronous, and the applied engine only appears once the
+    convert stage has resolved it, so a single read right after import can
+    legitimately show nothing yet.
+    """
+    deadline = time.monotonic() + timeout
+    requested, applied, parse_status = [], "", ""
+    while True:
+        r = await call("get_document_status", {"knowledge_id": knowledge_id})
+        status = (r.get("result") or {}).get("status") or {}
+        requested = status.get("requested_parser_engine_rules") or []
+        applied = status.get("applied_parser_engine") or ""
+        parse_status = status.get("parse_status") or ""
+        if applied or parse_status in ("failed", "completed") or time.monotonic() >= deadline:
+            return requested, applied, parse_status
+        await asyncio.sleep(3)
 
 
 async def _run_tools(report: Report):
@@ -102,6 +140,24 @@ async def _run_tools(report: Report):
 
     async def call(tool, arguments, timeout=120):
         return await webapp._call_tool(tool, arguments, kb_headers, timeout=timeout)
+
+    # --- list_parser_engines: the deployment's real parser catalog --------
+    # Also picks a non-default engine that advertises the scratch file's type,
+    # so the import below can prove a *requested* engine really reaches the
+    # pipeline instead of always falling back to the built-in default.
+    engine_name = ""
+    r = await call("list_parser_engines", {})
+    if r["ok"]:
+        engines = (r.get("result") or {}).get("engines") or []
+        available = [e for e in engines if e.get("available")]
+        report.add("list_parser_engines", "pass",
+                   f"engines={len(engines)} available={len(available)} "
+                   f"docreader_connected={(r.get('result') or {}).get('docreader_connected')}")
+        engine_name = next((e.get("name") or "" for e in available
+                            if e.get("name") != "builtin"
+                            and "md" in (e.get("file_types") or [])), "")
+    else:
+        report.add("list_parser_engines", "fail", r.get("error") or "")
 
     # --- list_documents → choose one completed markdown/pdf document -------
     doc_id, doc_title = "", ""
@@ -245,10 +301,11 @@ async def _run_tools(report: Report):
             report.add("query_knowledge_graph", "fail", r.get("error") or "")
 
     # --- upload_file → get_upload_status → import_document_file → delete ---
-    scratch_md = "# 控制台实测草稿\n\n这是 MCP 全工具实测自动创建的临时文档。\n"
+    run_id = uuid.uuid4().hex
+    scratch_md = f"# 控制台实测草稿 {run_id}\n\nMCP live fixture: {run_id}\n"
     r = await call("upload_file", {
         "knowledge_base_id": kb_id,
-        "file_name": "console-live-verify.md",
+        "file_name": f"console-live-verify-{run_id}.md",
         "content": base64.b64encode(scratch_md.encode("utf-8")).decode("ascii"),
     }, timeout=180)
     upload_id = ""
@@ -265,13 +322,32 @@ async def _run_tools(report: Report):
             report.add("get_upload_status", "pass", f"state={(r.get('result') or {}).get('state')}")
         else:
             report.add("get_upload_status", "fail", r.get("error") or "")
-        r = await call("import_document_file",
-                       {"knowledge_base_id": kb_id, "upload_id": upload_id}, timeout=180)
+        import_args = {"knowledge_base_id": kb_id, "upload_id": upload_id}
+        if engine_name:
+            import_args["process_config"] = {
+                "parser_engine_rules": [{"file_types": ["md"], "engine": engine_name}]}
+        r = await call("import_document_file", import_args, timeout=180)
         if r["ok"]:
             imported_doc = ((r.get("result") or {}).get("document") or {}).get("id") or ""
-            report.add("import_document_file", "pass", f"document_id={imported_doc[:8]}…")
-        else:
-            report.add("import_document_file", "fail", r.get("error") or "")
+            deduplicated = bool((r.get("result") or {}).get("deduplicated"))
+            report.add("import_document_file", "pass",
+                       f"document_id={imported_doc[:8]}… deduplicated={deduplicated}")
+            if deduplicated:
+                # 本轮的字节与既有文档重合：那份文档不是本轮创建的，不得删除。
+                print(f"本轮新建 ID 记录：imported={imported_doc}（deduplicated，保留给人工判断）")
+                imported_doc = ""
+            elif engine_name:
+                # 端到端：请求的引擎是否真的进了管线并被执行。
+                requested, applied, parse_status = await _await_applied_engine(call, imported_doc)
+                if applied:
+                    requested_names = [str(x.get("engine")) for x in requested]
+                    ok = applied == engine_name and engine_name in requested_names
+                    report.add("import process_config", "pass" if ok else "fail",
+                               f"requested={requested_names or '（状态未回显）'} applied={applied}")
+                else:
+                    report.add("import process_config", "skip",
+                               f"解析未在窗口内进入引擎选择（parse={parse_status or 'pending'}）；"
+                               f"已提交 process_config={engine_name}")
     else:
         report.add("get_upload_status", "skip", "没有 upload_id")
         report.add("import_document_file", "skip", "没有 upload_id")
@@ -279,7 +355,7 @@ async def _run_tools(report: Report):
     # --- add / update / delete --------------------------------------------
     scratch_doc = ""
     r = await call("add_document", {"knowledge_base_id": kb_id,
-                                    "title": "控制台实测草稿（add_document）",
+                                    "title": f"控制台实测草稿 {run_id}（add_document）",
                                     "content": scratch_md}, timeout=120)
     if r["ok"]:
         scratch_doc = ((r.get("result") or {}).get("document") or {}).get("id") or ""
@@ -297,7 +373,8 @@ async def _run_tools(report: Report):
     else:
         report.add("update_document", "skip", "add_document 未成功")
 
-    # --- cleanup: delete both scratch documents ----------------------------
+    print(f"本轮新建 ID 记录：imported={imported_doc or '（无）'} added={scratch_doc or '（无）'}")
+    # --- cleanup: 只清理本轮明确创建的草稿（dedup 命中的不在此列） ----------
     for label, target in [("delete_document(import)", imported_doc),
                           ("delete_document(add)", scratch_doc)]:
         if not target:
