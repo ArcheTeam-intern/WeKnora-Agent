@@ -294,6 +294,35 @@ function materialsMount(section) {
       };
       const wikiToggle = mkToggle("同时生成 Wiki 页面", "kb-new-wiki");
       const graphToggle = mkToggle("同时抽取知识图谱", "kb-new-graph");
+      const mkHinted = (label, value, placeholder, id, tag) => {
+        const lab = document.createElement("label");
+        lab.className = "field";
+        lab.innerHTML = `<span>${escapeHtml(label)}</span>`;
+        // 关系是多行文本：必须用 textarea，单行 input 会把换行吞掉。
+        const input = document.createElement(tag || "input");
+        input.className = "input wide";
+        if (tag === "textarea") input.rows = 4;
+        input.id = id;
+        input.value = value;
+        input.placeholder = placeholder;
+        lab.appendChild(input);
+        box.appendChild(lab);
+        return { lab, input };
+      };
+      // 只开图谱开关、不给实体/关系，抽取管线跑了也抽不出任何关系 ——
+      // 这正是「图谱查询报未配置」的常见原因，所以这里预填一套可直接用的例子。
+      const entityField = mkHinted("图谱实体类型（逗号分隔）", "人员,项目,服务,批次",
+        "例如：人员,项目,服务", "kb-new-entities");
+      const relationField = mkHinted("图谱关系（每行一条：起点,终点,关系）",
+        ["人员,项目,负责", "人员,项目,复核", "项目,服务,依赖", "批次,项目,属于"].join("\n"),
+        "例如：人员,项目,负责", "kb-new-relations", "textarea");
+      const syncGraphFields = () => {
+        for (const f of [entityField, relationField]) {
+          f.lab.classList.toggle("hidden", !graphToggle.checked);
+        }
+      };
+      graphToggle.onchange = syncGraphFields;
+      syncGraphFields();
 
       const actions = document.createElement("div");
       actions.className = "modal-actions";
@@ -312,17 +341,28 @@ function materialsMount(section) {
       ok.onclick = async () => {
         const name = nameInput.value.trim();
         if (!name) { toast("请填写知识库名称", "err"); return; }
+        const createArgs = {
+          name,
+          description: descInput.value.trim(),
+          enable_wiki: wikiToggle.checked,
+          enable_graph: graphToggle.checked,
+        };
+        if (graphToggle.checked) {
+          const entities = entityField.input.value.split(/[,\n，]/).map(t => t.trim()).filter(Boolean);
+          const relations = relationField.input.value.split(/\n/).map(t => t.trim()).filter(Boolean);
+          if (!entities.length && !relations.length) {
+            toast("勾了知识图谱，但没填实体/关系：这样抽不出任何关系，请至少填一项", "err");
+            return;
+          }
+          createArgs.graph_entities = entities;
+          createArgs.graph_relations = relations;
+        }
         const epoch = captureIdentityEpoch();
         ok.disabled = true;
         ok.textContent = "创建中…";
         const r = await api("/api/tool", {
           method: "POST",
-          json: { name: "create_knowledge_base", arguments: {
-            name,
-            description: descInput.value.trim(),
-            enable_wiki: wikiToggle.checked,
-            enable_graph: graphToggle.checked,
-          } },
+          json: { name: "create_knowledge_base", arguments: createArgs },
           headers: mcpHeaders(), brief: "新建知识库",
         });
         if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
@@ -1235,12 +1275,19 @@ function materialsMount(section) {
 
   // exampleKbFor 挑一个真正开启了某项能力的知识库：Wiki / 图谱示例如果落到没
   // 开该能力的库上，工具必然报「未配置」，那不是工具坏了而是挑错了库。
-  function exampleKbFor(capability) {
+  // capableKbs 列出真正具备某项能力的知识库。图谱额外看 graph_ready：
+  // 只开了开关但没配实体/关系类型的库，图谱查询照样会被拒（抽不出东西）。
+  function capableKbs(capability) {
     const kbs = S.kbs || [];
-    const has = k => !!(k.capability_flags || {})[capability];
-    // 当前上传目标如果有这项能力就用它（演示时选中的库优先），否则挑第一个具备该能力的。
-    const target = kbs.find(k => k.id === S.uploadTargetKbId && has(k));
-    return target || kbs.find(has) || null;
+    return kbs.filter(k => capability === "graph"
+      ? (k.graph_ready !== undefined ? !!k.graph_ready : !!(k.capability_flags || {}).graph)
+      : !!(k.capability_flags || {})[capability]);
+  }
+
+  function exampleKbFor(capability) {
+    const capable = capableKbs(capability);
+    // 当前上传目标如果有这项能力就用它（演示时选中的库优先），否则挑第一个具备的。
+    return capable.find(k => k.id === S.uploadTargetKbId) || capable[0] || null;
   }
 
   function capabilityHint(toolName, errorText) {
@@ -1249,13 +1296,18 @@ function materialsMount(section) {
     const needsWiki = /^wiki_/.test(toolName);
     if (!needsGraph && !needsWiki) return "";
     const cap = needsGraph ? "graph" : "wiki";
-    const capable = (S.kbs || []).filter(k => (k.capability_flags || {})[cap]);
+    const label = cap === "graph" ? "知识图谱" : "Wiki";
+    const capable = capableKbs(cap);
     if (!capable.length) {
-      return `当前可见的知识库里没有开启${cap === "graph" ? "知识图谱" : "Wiki"}的，` +
-        "可在「资料解析」页新建一个（勾选对应能力）并上传资料。";
+      const switchedOn = (S.kbs || []).filter(k => (k.capability_flags || {})[cap]);
+      if (cap === "graph" && switchedOn.length) {
+        return `《${switchedOn.map(k => k.name).join("、")}》开了图谱但没配实体/关系类型，` +
+          "所以抽不出任何关系；新建知识库时填上实体类型和关系即可（「填入示例」会自动切到可用的库）。";
+      }
+      return `当前可见的知识库里没有开启${label}的，可在「资料解析」页新建一个（勾选对应能力）并上传资料。`;
     }
-    return `这不是工具坏了：当前范围里没有开启${cap === "graph" ? "知识图谱" : "Wiki"}的库。` +
-      `已开启的有：${capable.map(k => k.name).join("、")}（在「填入示例」里会自动切到它）。`;
+    return `这不是工具坏了：当前范围里没有${cap === "graph" ? "可用的" : "开启"}${label}的库。` +
+      `可用的有：${capable.map(k => k.name).join("、")}（在「填入示例」里会自动切到它）。`;
   }
 
   async function exampleNewestDoc(kbId) {

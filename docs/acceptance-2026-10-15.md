@@ -202,3 +202,12 @@ PASS  add_document / update_document / delete_document（草稿自清 x2）
 - 图谱/Wiki 工具报 `GRAPH_EXTRACTION_NOT_CONFIGURED` 不是工具坏了，是当时选中的库没开该能力。工具示例现在会**自动挑一个已开启该能力的库**（优先当前上传目标），失败时也会列出哪些库可用。
 - 新建了演示库 **演示库-问答Wiki图谱**（`3daf893b…`）：开启 Wiki + 知识图谱 + OCR，模型继承工作区默认（embedding `c7dd10c9…`、QA `0142cc52…`、VLM `7d5d6380…`），内含验收 PDF（doc `3930c19c…`）。实测：解析/索引/摘要 completed，7 个分块、Wiki 13 页 15 链接、图谱 `query_knowledge_graph` 返回 7 条关系。
 - 起因是两个真实缺陷（已修，见 WeKnora commit）：MCP 建的库不带 embedding/summary/VLM 模型 → 首次导入必然 "model ID cannot be empty"；图谱开启但没配实体/关系类型 → 抽不出任何关系。
+
+## 第四轮：图谱"开了但没配类型"的澄清与修复
+
+用户建库时把 Wiki 与图谱都勾了，Wiki 正常但图谱查询报 `GRAPH_EXTRACTION_NOT_CONFIGURED`，而提示里又把该库列为"已开启图谱"。
+
+- 根因：`capability_flags.graph` 只反映"开关打开"，而 `query_knowledge_graph` 还要求**配置了实体/关系类型**（`graphKnowledgeBases` 会过滤掉类型为空的库）。两边口径不一致。
+- WeKnora 侧修复：`list_knowledge_bases` 新增 `graph_ready`（开关 + 至少一种实体/关系），图谱查询在"开了但没类型"时给出专门提示（说明该库 `graph_ready=false`、要配类型），不再笼统说"没有开启图谱的库"。
+- 控制台侧修复：新建知识库的弹窗在勾选图谱时**要求填写实体类型与关系**（预填了一套可直接用的示例：人员/项目/服务/批次 + 负责/复核/依赖/属于），避免再建出"开了也抽不出"的库；工具提示改看 `graph_ready`。
+- 用户已建的 `aaaa`（id `4975152c…`）保留：图谱类型需通过产品接口 `PUT /initialization/config/:kbId` 的 `nodeExtract` 配置，且**已入库的文档不会自动补抽**，需重新导入。演示时建议直接用已配好的《演示库-问答Wiki图谱》。
