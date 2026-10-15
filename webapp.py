@@ -75,6 +75,7 @@ _OPTIONAL_HEADERS = (
 # Tools that mutate state or consume one-shot credentials; the console
 # badges them and asks for confirmation before running them.
 DESTRUCTIVE_TOOLS = frozenset({
+    "create_knowledge_base",
     "upload_file",
     "import_document_file",
     "add_document",
