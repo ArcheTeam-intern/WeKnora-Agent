@@ -28,6 +28,40 @@ def test_config_expands_env_without_changing_native_sdk_shape(tmp_path, monkeypa
     assert json.loads(path.read_text(encoding="utf-8")) == config
 
 
+def test_langchain_client_targets_the_knowledge_core_surface(tmp_path, monkeypatch):
+    """The model-driven client talks to /mcp/core/:id, where only five tools exist.
+
+    Writing actions are not published on that surface at all, which is what keeps
+    a model from triggering an upload or a knowledge-base creation; the console's
+    own deterministic flows keep using the legacy path.
+    """
+    monkeypatch.setenv("TEST_MCP_TOKEN", "t")
+    config = {"weknora": {"transport": "streamable_http", "url": "http://localhost:18082/mcp/ep-123",
+                          "headers": {"Authorization": "Bearer ${TEST_MCP_TOKEN}"}}}
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    actual = module("main").load_connections(path)
+    assert actual["weknora"]["url"] == "http://localhost:18082/mcp/core/ep-123"
+
+    agent = module("agent")
+    # An already-core URL, a stdio fixture and a non-MCP URL are left alone.
+    assert agent.core_url_for("http://h/mcp/core/ep-1") == "http://h/mcp/core/ep-1"
+    assert agent.core_url_for("stdio") == "stdio"
+    assert agent.core_url_for("http://h/api/v1/knowledge-bases") == "http://h/api/v1/knowledge-bases"
+    assert agent.core_url_for("http://h/mcp/ep-1/trailing") == "http://h/mcp/ep-1/trailing"
+
+
+def test_read_only_allowlist_covers_both_surfaces_and_no_write_action():
+    agent = module("agent")
+    # The core surface's two read actions are allowed by name...
+    assert agent.CORE_READ_ONLY_TOOLS <= agent.READ_ONLY_TOOLS
+    # ...while the core's write actions are not, on either surface's naming.
+    for write_name in ("knowledge_base", "ingest_document", "upload_file",
+                       "import_document_file", "add_document", "update_document",
+                       "delete_document", "create_knowledge_base"):
+        assert write_name not in agent.READ_ONLY_TOOLS
+
+
 def test_missing_env_fails_before_connecting(tmp_path, monkeypatch):
     monkeypatch.delenv("MISSING_MCP_TOKEN", raising=False)
     path = tmp_path / "mcp.json"

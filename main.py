@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from agent import build_agent
+from agent import build_agent, core_connections
 
 
 class ConfigurationError(ValueError):
@@ -52,7 +52,11 @@ def load_connections(path, *, header_overrides=None):
                    if key.lower() not in identity | overridden}
         headers.update(header_overrides)
         conn["headers"] = headers
-    return expand(connections)
+    expanded = expand(connections)
+    # The LangChain client is the one component where a model picks tools, so it
+    # talks to the five-tool knowledge core (write actions are not on that
+    # surface at all, and agent.py additionally filters to the read-only two).
+    return core_connections(expanded)
 
 
 async def run(question, model, connections, *, timeout=120, recursion_limit=20):

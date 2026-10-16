@@ -4,12 +4,57 @@ import logging
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-READ_ONLY_TOOLS = {
+# Read-only tool names, from both surfaces the fork can expose:
+#   * the legacy catalogue (/mcp/:endpoint_id, 22 tools) — the console's own
+#     deterministic flows still use it while its UI migrates;
+#   * the five-tool knowledge core (/mcp/core/:endpoint_id) — search_knowledge
+#     and read_document are its only read actions, and both names also exist in
+#     the legacy catalogue, so one allowlist covers either surface.
+# A model choosing tools must never see a write action: knowledge_base.create
+# and ingest_document.submit stay outside this set on purpose.
+CORE_READ_ONLY_TOOLS = {"search_knowledge", "read_document"}
+
+LEGACY_READ_ONLY_TOOLS = {
     "list_knowledge_bases", "list_documents", "search_knowledge", "grep_chunks",
     "read_document", "wiki_index", "wiki_search", "wiki_read_page",
     "wiki_list_pages", "wiki_graph", "query_knowledge_graph",
     "get_document_status", "get_knowledge_base_status",
 }
+
+READ_ONLY_TOOLS = LEGACY_READ_ONLY_TOOLS | CORE_READ_ONLY_TOOLS
+
+
+def core_url_for(url):
+    """Return the knowledge-core variant of an MCP endpoint URL.
+
+    The core surface is mounted at /mcp/core/:endpoint_id next to the legacy
+    /mcp/:endpoint_id. The LangChain client is the component that lets a model
+    pick its own tools, so it talks to the five-tool surface; a URL that is
+    already a core URL, or that is not an /mcp/ URL at all (a stdio fixture, for
+    instance), is returned unchanged.
+    """
+    if not isinstance(url, str) or "/mcp/core/" in url:
+        return url
+    marker = "/mcp/"
+    index = url.find(marker)
+    if index < 0:
+        return url
+    prefix, _, endpoint = url.partition(marker)
+    if not endpoint or "/" in endpoint:
+        return url
+    return f"{prefix}{marker}core/{endpoint}"
+
+
+def core_connections(connections):
+    """Rewrite the weknora connection of a connections mapping onto the core path."""
+    if not isinstance(connections, dict):
+        return connections
+    rewritten = {}
+    for name, conn in connections.items():
+        if name == "weknora" and isinstance(conn, dict) and "url" in conn:
+            conn = {**conn, "url": core_url_for(conn["url"])}
+        rewritten[name] = conn
+    return rewritten
 
 SYSTEM_PROMPT = """你通过 WeKnora MCP 检索知识并回答问题。
 依据工具返回的资料回答，保留可核验的 document_id、chunk_id、Wiki slug 或关系来源。
