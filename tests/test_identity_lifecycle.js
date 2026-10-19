@@ -104,7 +104,7 @@ function boot() {
     performance: { now: () => Date.now() },
     fetch: fakeFetch, console,
     TextDecoder, TextEncoder, atob, btoa, crypto: { randomUUID },
-    FormData, File, Blob, URL,
+    FormData, File, Blob, URL, URLSearchParams,
     setTimeout: () => 0, clearTimeout: () => {}, setInterval: () => 0, clearInterval: () => {},
     Date, JSON, Math, Promise, Object, Array, String, Number, Boolean, Error, RegExp, Map, Set,
   });
@@ -177,7 +177,7 @@ test("a late answer from identity A never reaches identity B", async () => {
   await flush();
 });
 
-/* ---------------- 2. 上传：迟到回执不得写回 ---------------- */
+/* ---------------- 2. 提交：迟到回执不得写回 ---------------- */
 test("a late upload receipt from A never lands in B's materials view", async () => {
   const w = boot();
   const section = w.document.getElementById("view-materials");
@@ -190,24 +190,26 @@ test("a late upload receipt from A never lands in B's materials view", async () 
   fileInput.files = [new File(["x"], "note.md")];
   fileInput.onchange();
   section.querySelector("#m-kb").value = "kb-1";
-  section.querySelector("#m-upload").onclick();
+  section.querySelector("#m-ingest").onclick();
   await flush();
-  const uploadCall = takeCall("/api/upload");
+  const submitCall = takeCall("/api/ingest");
 
   setIdentity(w, "b@example.com", "token-b");
   w.App.setActiveProfile("b@example.com");
   await flush();
 
-  uploadCall.resolve(jsonResp(200, { ok: true, result: { upload_id: "up-a", file_name: "note.md", file_size: 1, sha256: "ab" } }));
+  submitCall.resolve(jsonResp(200, { ok: true, result: {
+    ingest_id: "i-a", upload_id: "up-a", document_id: "doc-a",
+    file_name: "note.md", stage: "queued", queued: true } }));
   await flush();
-  assert.notEqual(section.querySelector("#m-upload-status").textContent, "上传成功",
+  assert.ok(!/已提交/.test(section.querySelector("#m-import-status").textContent),
     "A 的完成态不得写入 B 的状态行");
   assert.equal(section.querySelector("#m-receipt").innerHTML, "", "A 的回执不得写入 B 的面板");
   assert.equal(w.App.S.trace.length, 0, "迟到响应不得写入轨迹");
 });
 
-/* ---------------- 3. 导入：迟到文档不得写回 ---------------- */
-test("a late import result from A never writes B's document state", async () => {
+/* ---------------- 3. 提交：迟到文档不得写回 ---------------- */
+test("a late submit result from A never writes B's document state", async () => {
   const w = boot();
   const section = w.document.getElementById("view-materials");
   w.Views.show("materials", section);
@@ -216,28 +218,24 @@ test("a late import result from A never writes B's document state", async () => 
   setIdentity(w, "a@example.com", "token-a");
   section.querySelector("#m-kb").value = "kb-1";
 
-  // 先完成一次上传，让 M.receipt 就绪（同一身份）。
   const fileInput = section.querySelector("#m-file");
   fileInput.files = [new File(["x"], "note.md")];
   fileInput.onchange();
-  section.querySelector("#m-upload").onclick();
+  section.querySelector("#m-ingest").onclick();
   await flush();
-  takeCall("/api/upload").resolve(jsonResp(200, { ok: true, result: { upload_id: "up-1", file_name: "note.md", file_size: 1, sha256: "ab" } }));
-  await flush();
-  assert.equal(section.querySelector("#m-import").disabled, false);
-
-  section.querySelector("#m-import").onclick();
-  await flush();
-  const importCall = takeCall("/api/import");
+  const submitCall = takeCall("/api/ingest");
 
   setIdentity(w, "b@example.com", "token-b");
   w.App.setActiveProfile("b@example.com");
   await flush();
 
-  importCall.resolve(jsonResp(200, { ok: true, result: { document: { id: "doc-A", title: "A 的文档" }, queued: true } }));
+  submitCall.resolve(jsonResp(200, { ok: true, result: {
+    ingest_id: "i-a", upload_id: "up-1", document_id: "doc-A",
+    file_name: "note.md", stage: "queued", queued: true } }));
   await flush();
   assert.equal(section.querySelector("#m-doc").textContent, "", "A 的 document id 不得写入 B 的面板");
-  assert.equal(section.querySelector("#m-op-id").value, "", "写工具输入不得被 A 的结果预填");
+  assert.equal(pending.filter(c => c.path.includes("/api/ingest_status")).length, 0,
+    "A 的迟到结果不得触发 B 的状态轮询");
 });
 
 /* ---------------- 4. 清单：迟到 step/done 不得渲染 ---------------- */
@@ -328,23 +326,29 @@ test("an idempotency conflict is retried once with a fresh key", async () => {
   fileInput.files = [new File([new Uint8Array([3])], "third.pdf", { type: "application/pdf" })];
   fileInput.onchange();
 
-  const st = section.querySelector("#m-upload-status");
-  section.querySelector("#m-upload").onclick();
+  const st = section.querySelector("#m-import-status");
+  section.querySelector("#m-ingest").onclick();
   await flush();
-  const first = takeCall("/api/upload");
+  const first = takeCall("/api/ingest");
   const key1 = first.opts.headers["Idempotency-Key"];
-  assert.ok(key1, "上传请求必须带 Idempotency-Key");
+  assert.ok(key1, "提交请求必须带 Idempotency-Key");
 
   // 服务端按幂等契约拒绝：同一标识配了不同字节。
   first.resolve(jsonResp(200, { ok: false, error: "this Idempotency-Key was already used for a different file or knowledge base", error_code: "IDEMPOTENCY_CONFLICT" }));
   await flush();
-  const second = takeCall("/api/upload");
+  const second = takeCall("/api/ingest");
   const key2 = second.opts.headers["Idempotency-Key"];
   assert.notEqual(key2, key1, "冲突后必须用新标识重试");
-  second.resolve(jsonResp(200, { ok: true, result: { upload_id: "u-1", file_name: "third.pdf" } }));
+  second.resolve(jsonResp(200, { ok: true, result: {
+    ingest_id: "i-1", upload_id: "u-1", document_id: "doc-1", file_name: "third.pdf",
+    stage: "queued", queued: true, deduplicated: false } }));
   await flush();
-  assert.equal(st.textContent, "上传成功");
-  assert.equal(section.querySelector("#m-import").disabled, false, "重试成功后导入按钮应可用");
+  assert.ok(/已提交/.test(st.textContent), "重试成功后应显示提交回执：" + st.textContent);
+  // 提交成功即开始轮询该文档的状态。
+  takeCall("/api/ingest_status").resolve(jsonResp(200, { ok: true, result: {
+    stage: "imported", phases: { upload: "imported", parse: "completed", index: "completed" },
+    document: { parse_status: "completed", index_status: "completed", title: "third.pdf" } } }));
+  await flush();
 });
 
 /* ---------------- 7. 资料页：刷新后能找回上次导入并继续看进度 ---------------- */
@@ -352,10 +356,11 @@ test("a refreshed page restores the last import and keeps polling it", async () 
   const w = boot();
   const section = w.document.getElementById("view-materials");
   setIdentity(w, "a@example.com", "token-a");
-  // 模拟「上次会话记录」：真实路径由上传/导入成功时写进 sessionStorage。
+  // 模拟「上次会话记录」：真实路径由提交成功时写进 sessionStorage。
   w.sessionStorage.setItem("wk.materials.last", JSON.stringify({
     email: "a@example.com", workspace: "2", engine: "__default__",
-    receipt: { channel: "tool", kb: "kb-1", upload_id: "u-1", file_name: "青岚计划.pdf", file_size: 159000, sha256: "abc" },
+    receipt: { kb: "kb-1", ingest_id: "i-1", upload_id: "u-1", document_id: "doc-1",
+               file_name: "青岚计划.pdf", file_size: 159000, stage: "queued" },
     doc: { id: "doc-1", title: "青岚计划.pdf" }, at: Date.now(),
   }));
   w.Views.show("materials", section);
@@ -363,14 +368,16 @@ test("a refreshed page restores the last import and keeps polling it", async () 
 
   assert.equal(section.querySelector("#m-doc").textContent, "doc-1", "恢复后应显示上次的文档");
   assert.ok(/恢复上次导入记录/.test(section.querySelector("#m-import-status").textContent), "应提示这是恢复的记录");
-  assert.equal(section.querySelector("#m-import").disabled, false, "恢复后导入按钮可用（可直接重试）");
+  assert.equal(section.querySelector("#m-ingest").disabled, false, "恢复后提交按钮可用（可直接重试）");
 
-  // 恢复后立刻续看状态：应发出一次 document_status 查询。
-  const statusCall = takeCall("/api/document_status");
-  statusCall.resolve(jsonResp(200, { ok: true, result: { status: {
-    parse_status: "running", index_status: "pending", applied_parser_engine: "anydoc",
-    requested_parser_engine_rules: [{ file_types: ["pdf"], engine: "anydoc" }], file_type: "pdf",
-  } } }));
+  // 恢复后立刻续看状态：应发出一次 ingest_document.status 查询。
+  const statusCall = takeCall("/api/ingest_status");
+  statusCall.resolve(jsonResp(200, { ok: true, result: {
+    stage: "staged", phases: { upload: "imported", parse: "running", index: "pending" },
+    document: { parse_status: "running", index_status: "pending",
+                applied_parser_engine: "anydoc",
+                requested_parser_engine_rules: [{ file_types: ["pdf"], engine: "anydoc" }],
+                file_type: "pdf" } } }));
   await flush();
   const panel = section.querySelector("#m-doc-status").innerHTML;
   assert.ok(/解析中/.test(panel), "进度面板应显示中文解析状态：" + panel.slice(0, 120));
@@ -387,23 +394,22 @@ test("a finished parse shows the chunk preview in the progress panel", async () 
   const fileInput = section.querySelector("#m-file");
   fileInput.files = [new File([new Uint8Array([9])], "done.pdf", { type: "application/pdf" })];
   fileInput.onchange();
-  section.querySelector("#m-upload").onclick();
+  section.querySelector("#m-ingest").onclick();
   await flush();
-  takeCall("/api/upload").resolve(jsonResp(200, { ok: true, result: { upload_id: "u-9", file_name: "done.pdf" } }));
-  await flush();
-  section.querySelector("#m-import").onclick();
-  await flush();
-  takeCall("/api/import").resolve(jsonResp(200, { ok: true, result: { queued: true, deduplicated: false, document: { id: "doc-9", title: "done.pdf" } } }));
+  takeCall("/api/ingest").resolve(jsonResp(200, { ok: true, result: {
+    ingest_id: "i-9", upload_id: "u-9", document_id: "doc-9", file_name: "done.pdf",
+    stage: "queued", queued: true, deduplicated: false } }));
   await flush();
 
-  takeCall("/api/document_status").resolve(jsonResp(200, { ok: true, result: { status: {
-    parse_status: "completed", index_status: "completed", applied_parser_engine: "default", file_type: "pdf",
-  } } }));
+  takeCall("/api/ingest_status").resolve(jsonResp(200, { ok: true, result: {
+    stage: "imported", phases: { upload: "imported", parse: "completed", index: "completed" },
+    document: { parse_status: "completed", index_status: "completed",
+                applied_parser_engine: "default", file_type: "pdf" } } }));
   await flush();
-  takeCall("/api/tool").resolve(jsonResp(200, { ok: true, result: {
+  takeCall("/api/tool").resolve(jsonResp(200, { ok: true, result: { document: {
     total_chunks: 12, fetched_chunks: 1,
     chunks: [{ content: "青岚计划 QL-2026-417 负责人林澈" }],
-  } }));
+  } } }));
   await flush();
   const panel = section.querySelector("#m-doc-status").innerHTML;
   assert.ok(/解析完成/.test(panel), "完成后应给出完成提示");
@@ -420,9 +426,11 @@ test("a tool example fills real ids from the live workspace", async () => {
   w.App.S.kbs = [{ id: "kb-1", name: "验收库", type: "document", capability_flags: {} }];
   w.App.S.uploadTargetKbId = "kb-1";
   w.App.S.tools = [{
-    name: "get_document_status", description: "d", destructive: false,
-    inputSchema: { type: "object", required: ["knowledge_id"],
-                   properties: { knowledge_id: { type: "string", description: "Document id" } } },
+    name: "read_document", description: "d", destructive: false,
+    inputSchema: { type: "object", required: ["action"],
+                   properties: { action: { type: "string", enum: ["list", "read"] },
+                                 knowledge_id: { type: "string", description: "Document id" },
+                                 limit: { type: "number", description: "chunks" } } },
   }];
   w.Views.show("bench", section);
   const item = section.querySelector("#b-list").children.find(c => String(c.className).includes("tool-item"));
@@ -435,19 +443,25 @@ test("a tool example fills real ids from the live workspace", async () => {
   // 示例先解析出「最近一篇文档」，再把它填进 knowledge_id。
   const lookup = takeCall("/api/tool");
   const lookupBody = JSON.parse(lookup.opts.body);
-  assert.equal(lookupBody.name, "list_documents");
+  assert.equal(lookupBody.name, "read_document");
+  assert.equal(lookupBody.arguments.action, "list");
   assert.equal(lookupBody.arguments.knowledge_base_id, "kb-1");
-  lookup.resolve(jsonResp(200, { ok: true, result: { documents: [
-    { id: "doc-42", title: "青岚计划.pdf", parse_status: "completed" },
-    { id: "doc-41", title: "旧文档.md", parse_status: "completed" },
-  ] } }));
+  lookup.resolve(jsonResp(200, { ok: true, result: {
+    source_type: "document", knowledge_base_id: "kb-1",
+    documents: { total: 2, documents: [
+      { id: "doc-42", title: "青岚计划.pdf", parse_status: "completed" },
+      { id: "doc-41", title: "旧文档.md", parse_status: "completed" },
+    ] } } }));
   await flush();
 
   assert.equal(w.App.S.tools.length, 1);
   const filled = detail.querySelector("#b-form");
-  const input = filled.children.find(c => String(c.tagName) === "label");
-  assert.ok(input, "表单应渲染出字段");
-  assert.equal(input.children[0].value, "doc-42", "示例应填入真实文档 id");
+  const labels = filled.children.filter(c => String(c.tagName) === "label");
+  const target = labels.find(l => String(l.innerHTML).includes("knowledge_id"));
+  assert.ok(target, "表单应渲染出 knowledge_id 字段");
+  assert.equal(target.children[0].value, "doc-42", "示例应填入真实文档 id");
+  assert.equal(labels.find(l => String(l.innerHTML).includes("action")).children[0].value, "read",
+               "示例应把 action 填成 read");
   assert.ok(/青岚计划/.test(detail.querySelector("#b-example-note").textContent), "示例说明应指出用的是哪篇文档");
 });
 

@@ -38,8 +38,7 @@ def client():
 # --- header gate -----------------------------------------------------------
 
 @pytest.mark.parametrize("path", ["/api/kbs", "/api/tools", "/api/endpoint",
-                                  "/api/upload_status?upload_id=u",
-                                  "/api/document_status?knowledge_id=k",
+                                  "/api/ingest_status?ingest_id=i",
                                   "/api/kb_status?knowledge_base_id=kb"])
 def test_mcp_routes_require_identity_headers(client, path):
     r = client.get(path)
@@ -48,11 +47,12 @@ def test_mcp_routes_require_identity_headers(client, path):
 
 
 def test_discovery_works_before_any_kb_selection_exists(client, monkeypatch):
-    """list_knowledge_bases IS how a selection gets discovered, so the
+    """knowledge_base.list IS how a selection gets discovered, so the
     identity-only request (no KB header) must pass the gate and reach MCP
     unnarrowed."""
     async def fake_call(name, arguments, headers, timeout=60):
-        assert name == "list_knowledge_bases"
+        assert name == "knowledge_base"
+        assert arguments == {"action": "list"}
         assert "X-WeKnora-Knowledge-Base-Ids" not in headers
         return {"ok": True, "result": {"knowledge_bases": [{"id": "kb-1", "name": "K"}]},
                 "http_status": 200}
@@ -134,8 +134,8 @@ def test_tools_marks_destructive_entries(client, monkeypatch):
         assert method == "tools/list"
         return {"ok": True, "result": {"tools": [
             {"name": "search_knowledge", "description": "d", "inputSchema": {"type": "object"}},
-            {"name": "delete_document", "description": "d", "inputSchema": {"type": "object"}},
-            {"name": "upload_file", "description": "d", "inputSchema": {"type": "object"}},
+            {"name": "ingest_document", "description": "d", "inputSchema": {"type": "object"}},
+            {"name": "read_document", "description": "d", "inputSchema": {"type": "object"}},
         ]}}
     monkeypatch.setattr(webapp, "_mcp_rpc", fake_rpc)
 
@@ -143,20 +143,21 @@ def test_tools_marks_destructive_entries(client, monkeypatch):
     assert r.status_code == 200
     tools = {t["name"]: t for t in r.json()["tools"]}
     assert tools["search_knowledge"]["destructive"] is False
-    assert tools["delete_document"]["destructive"] is True
-    assert tools["upload_file"]["destructive"] is True
+    assert tools["ingest_document"]["destructive"] is True
+    assert tools["read_document"]["destructive"] is False
 
 
 def test_run_tool_reports_duration_and_error_code(client, monkeypatch):
     async def fake_call(name, arguments, headers, timeout=60):
-        assert name == "delete_document"
+        assert name == "ingest_document"
+        assert arguments["action"] == "submit"
         return {"ok": False, "result": {"error": {"code": "KB_OUT_OF_SCOPE"}},
                 "error": "outside scope", "error_code": "KB_OUT_OF_SCOPE",
                 "http_status": 200}
     monkeypatch.setattr(webapp, "_call_tool", fake_call)
 
     r = client.post("/api/tool", headers=HEADERS,
-                    json={"name": "delete_document", "arguments": {"knowledge_id": "k"}})
+                    json={"name": "ingest_document", "arguments": {"action": "submit"}})
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is False
@@ -173,12 +174,42 @@ def _kb_payload(*, wiki: bool, graph: bool):
     }]}
 
 
+def _kb_detail(*, wiki_available: str = "", graph_available: str = ""):
+    # The real shape: knowledge_base.get wraps the legacy status payload,
+    # which nests the counters under "status" (detail.status.status).
+    status = {"documents": 1, "chunks": 2}
+    if wiki_available:
+        status["wiki"] = {"available": wiki_available}
+    if graph_available:
+        status["graph"] = {"available": graph_available}
+    return {"knowledge_base": {
+        "status": {"knowledge_base_id": "kb-1", "status": status},
+        "parser_engines": {"engines": [{"name": "builtin", "available": True}]},
+        "qa_profiles": [{"id": "", "label": "端点默认"}],
+    }}
+
+
+def _ingest_payload(parse: str = "completed"):
+    return {
+        "stage": "imported",
+        "phases": {"upload": "imported", "parse": parse,
+                   "index": "completed" if parse == "completed" else "unknown"},
+        "document": {"parse_status": parse,
+                     "index_status": "completed" if parse == "completed" else "unknown",
+                     "title": "T",
+                     "error_message": "boom" if parse == "failed" else ""},
+    }
+
+
 def _scripted_rpc(routes):
-    """routes: tool name -> (ok, result-or-error)."""
+    """routes: "name.action" (or bare "name") -> (ok, result-or-error)."""
     async def fake_call(name, arguments, headers, timeout=60):
-        if name not in routes:
+        action = (arguments or {}).get("action") or ""
+        key = f"{name}.{action}" if action else name
+        route = routes.get(key, routes.get(name))
+        if route is None:
             return {"ok": True, "result": {}, "http_status": 200}
-        ok, payload = routes[name]
+        ok, payload = route
         if ok:
             return {"ok": True, "result": payload, "http_status": 200}
         return {"ok": False, "result": payload, "error": payload.get("error", {}).get("message"),
@@ -186,62 +217,73 @@ def _scripted_rpc(routes):
     return fake_call
 
 
+def _checklist_read_routes():
+    return {
+        "read_document.list": (True, {"documents": {
+            "total": 1, "documents": [{"id": "doc-1", "title": "T",
+                                        "parse_status": "completed"}]}}),
+        "read_document.read": (True, {"document": {
+            "chunks": [{"content": "x"}], "truncated": False,
+            "total_chunks": 1, "document": {"title": "T"}}}),
+        "search_knowledge": (True, {"results": {"document": {"results": [{"chunk_id": "c"}]}}}),
+    }
+
+
 def test_checklist_skips_wiki_and_graph_when_capabilities_are_off(client, monkeypatch):
     routes = {
-        "list_knowledge_bases": (True, _kb_payload(wiki=False, graph=False)),
-        "get_document_status": (True, {"status": {"parse_status": "completed",
-                                                  "index_status": "completed"}}),
-        "read_document": (True, {"document": {"title": "T"}, "truncated": False}),
-        "list_documents": (True, {"total": 1}),
-        "search_knowledge": (True, {"results": [{"chunk_id": "c"}]}),
-        "grep_chunks": (True, {"results": []}),
-        "get_knowledge_base_status": (True, {"status": {"documents": 1, "chunks": 2}}),
+        "knowledge_base.list": (True, _kb_payload(wiki=False, graph=False)),
+        "knowledge_base.get": (True, _kb_detail()),
+        "ingest_document": (True, _ingest_payload()),
+        **_checklist_read_routes(),
     }
     monkeypatch.setattr(webapp, "_call_tool", _scripted_rpc(routes))
     r = client.post("/api/checklist", headers=HEADERS,
-                    json={"knowledge_base_id": "kb-1", "knowledge_id": "doc-1"})
+                    json={"knowledge_base_id": "kb-1", "document_id": "doc-1"})
     assert r.status_code == 200
     events = _sse_events(r)
     steps = {e["tool"]: e for e in events if e["type"] == "step"}
-    assert steps["wiki_index"]["status"] == "skip"
-    assert "未启用 Wiki" in steps["wiki_index"]["summary"]
-    assert steps["query_knowledge_graph"]["status"] == "skip"
-    assert "未启用图谱抽取" in steps["query_knowledge_graph"]["summary"]
-    assert steps["read_document"]["status"] == "pass"
+    assert steps["read_document.list(wiki)"]["status"] == "skip"
+    assert "未启用 Wiki" in steps["read_document.list(wiki)"]["summary"]
+    assert steps["search_knowledge.graph"]["status"] == "skip"
+    assert "未启用图谱抽取" in steps["search_knowledge.graph"]["summary"]
+    assert steps["read_document.read"]["status"] == "pass"
+    assert steps["ingest_document.status"]["status"] == "pass"
     done = [e for e in events if e["type"] == "done"][0]
     assert done["summary"]["fail"] == 0
 
 
 def test_checklist_reports_graph_config_state_as_skip_not_failure(client, monkeypatch):
     routes = {
-        "list_knowledge_bases": (True, _kb_payload(wiki=False, graph=True)),
-        "get_document_status": (True, {"status": {"parse_status": "completed"}}),
-        "get_knowledge_base_status": (True, {"status": {"documents": 1, "chunks": 1,
-                                                        "graph": {"available": "available"}}}),
-        "query_knowledge_graph": (False, {"error": {"code": "GRAPH_EXTRACTION_NOT_CONFIGURED",
-                                                    "message": "no extract config"}}),
+        "knowledge_base.list": (True, _kb_payload(wiki=False, graph=True)),
+        "knowledge_base.get": (True, _kb_detail(graph_available="available")),
+        "ingest_document": (True, _ingest_payload()),
+        **_checklist_read_routes(),
+        "search_knowledge": (True, {
+            "results": {}, "partial": True, "failed_sources": ["graph"],
+            "failures": [{"source": "graph",
+                          "error": "GRAPH_EXTRACTION_NOT_CONFIGURED: no extract config"}]}),
     }
     monkeypatch.setattr(webapp, "_call_tool", _scripted_rpc(routes))
     r = client.post("/api/checklist", headers=HEADERS,
-                    json={"knowledge_base_id": "kb-1", "knowledge_id": "doc-1"})
+                    json={"knowledge_base_id": "kb-1", "document_id": "doc-1"})
     steps = {e["tool"]: e for e in _sse_events(r) if e["type"] == "step"}
-    assert steps["query_knowledge_graph"]["status"] == "skip"
-    assert "GRAPH_EXTRACTION_NOT_CONFIGURED" in steps["query_knowledge_graph"]["summary"]
+    assert steps["search_knowledge.graph"]["status"] == "skip"
+    assert "GRAPH_EXTRACTION_NOT_CONFIGURED" in steps["search_knowledge.graph"]["summary"]
 
 
 def test_checklist_aborts_read_steps_when_parse_failed(client, monkeypatch):
     routes = {
-        "list_knowledge_bases": (True, _kb_payload(wiki=False, graph=False)),
-        "get_document_status": (True, {"status": {"parse_status": "failed",
-                                                  "error_message": "boom"}}),
+        "knowledge_base.list": (True, _kb_payload(wiki=False, graph=False)),
+        "knowledge_base.get": (True, _kb_detail()),
+        "ingest_document": (True, _ingest_payload(parse="failed")),
     }
     monkeypatch.setattr(webapp, "_call_tool", _scripted_rpc(routes))
     r = client.post("/api/checklist", headers=HEADERS,
-                    json={"knowledge_base_id": "kb-1", "knowledge_id": "doc-1"})
+                    json={"knowledge_base_id": "kb-1", "document_id": "doc-1"})
     steps = {e["tool"]: e for e in _sse_events(r) if e["type"] == "step"}
-    assert steps["get_document_status"]["status"] == "fail"
-    assert steps["read_document"]["status"] == "skip"
-    assert "解析未完成" in steps["read_document"]["summary"]
+    assert steps["ingest_document.status"]["status"] == "fail"
+    assert steps["read_document.read"]["status"] == "skip"
+    assert "解析未完成" in steps["read_document.read"]["summary"]
 
 
 # --- static assets ---------------------------------------------------------
@@ -342,17 +384,18 @@ def test_checklist_route_classifies_initial_mcp_401_before_done(client, monkeypa
     assert error["http_status"] == 401 and error["error_code"] == "UNAUTHORIZED"
     assert events.index(error) < next(i for i, event in enumerate(events) if event["type"] == "done")
     assert events[-1]["summary"]["fail"] == 1
-    assert calls == ["list_knowledge_bases"]
+    assert calls == ["knowledge_base"]
 
 
 @pytest.mark.asyncio
 async def test_document_poll_retains_401_fields_after_processing(monkeypatch):
-    replies = [{"ok": True, "result": {"status": {"parse_status": "processing"}}, "http_status": 200},
+    replies = [{"ok": True, "result": {"phases": {"parse": "processing"}, "document": {}},
+                "http_status": 200},
         {"ok": False, "http_status": 401, "error_code": "UNAUTHORIZED", "error": "MCP HTTP 401"}]
     async def call(*args, **kwargs): return replies.pop(0)
     monkeypatch.setattr(webapp, "_call_tool", call)
     monkeypatch.setattr(webapp, "CHECKLIST_POLL_INTERVAL", 0)
-    result = await webapp._poll_document("doc-1", HEADERS)
+    result = await webapp._poll_ingest("ingest-1", "doc-1", HEADERS)
     assert result["ok"] is False
     assert result["http_status"] == 401 and result["error_code"] == "UNAUTHORIZED"
     assert replies == []
@@ -362,22 +405,27 @@ def test_checklist_revoked_jwt_during_poll_is_an_auth_error_and_stops(client, mo
     calls = []
     async def call(name, arguments, headers, timeout=60):
         calls.append(name)
-        if name == "list_knowledge_bases":
+        action = (arguments or {}).get("action")
+        if name == "knowledge_base" and action == "list":
             return {"ok": True, "result": _kb_payload(wiki=False, graph=False), "http_status": 200}
-        if name == "get_document_status":
+        if name == "knowledge_base" and action == "get":
+            return {"ok": True, "result": _kb_detail(), "http_status": 200}
+        if name == "ingest_document":
             if calls.count(name) == 1:
-                return {"ok": True, "result": {"status": {"parse_status": "processing"}}, "http_status": 200}
-            return {"ok": False, "http_status": 401, "error_code": "UNAUTHORIZED", "error": "MCP HTTP 401"}
+                return {"ok": True, "result": {"phases": {"parse": "processing"}},
+                        "http_status": 200}
+            return {"ok": False, "http_status": 401, "error_code": "UNAUTHORIZED",
+                    "error": "MCP HTTP 401"}
         return {"ok": True, "result": {}, "http_status": 200}
     monkeypatch.setattr(webapp, "_call_tool", call)
     monkeypatch.setattr(webapp, "CHECKLIST_POLL_INTERVAL", 0)
     events = _sse_events(client.post("/api/checklist", headers=HEADERS,
-        json={"knowledge_base_id": "kb-1", "knowledge_id": "doc-1"}))
-    failure = next(event for event in events if event.get("tool") == "get_document_status")
+        json={"knowledge_base_id": "kb-1", "document_id": "doc-1"}))
+    failure = next(event for event in events if event.get("tool") == "ingest_document.status")
     assert failure["http_status"] == 401 and failure["error_code"] == "UNAUTHORIZED"
     error = next(event for event in events if event["type"] == "error")
     assert error["http_status"] == 401 and error["error_code"] == "UNAUTHORIZED"
-    assert calls == ["list_knowledge_bases", "get_document_status", "get_document_status"]
+    assert calls == ["knowledge_base", "knowledge_base", "ingest_document", "ingest_document"]
     assert events[-1]["type"] == "done" and events[-1]["summary"]["fail"] == 1
 
 
@@ -442,37 +490,81 @@ def test_local_credential_refuses_non_local_hosts(client, monkeypatch, tmp_path)
 
 # --- parser engine catalog proxy ------------------------------------------
 
-def test_parser_engines_proxies_the_mcp_catalog(client, monkeypatch):
+def test_parser_engines_proxies_the_core_catalog(client, monkeypatch):
     async def fake_call(name, arguments, headers, timeout=60):
-        assert name == "list_parser_engines"
-        return {"ok": True, "http_status": 200, "result": {
-            "engines": [{"name": "builtin", "available": True, "file_types": ["pdf"]}],
-            "docreader_connected": True,
-        }}
+        assert name == "knowledge_base"
+        assert arguments == {"action": "get", "knowledge_base_id": "kb-1",
+                             "include_capabilities": True}
+        return {"ok": True, "http_status": 200, "result": {"knowledge_base": {
+            "parser_engines": {
+                "engines": [{"name": "builtin", "available": True, "file_types": ["pdf"]}],
+                "docreader_connected": True,
+            }}}}
     monkeypatch.setattr(webapp, "_call_tool", fake_call)
-    r = client.get("/api/parser-engines", headers=HEADERS)
+    r = client.get("/api/parser-engines?knowledge_base_id=kb-1", headers=HEADERS)
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True
     assert body["result"]["engines"][0]["name"] == "builtin"
 
 
+def test_parser_engines_falls_back_to_the_first_visible_library(client, monkeypatch):
+    calls = []
+    async def fake_call(name, arguments, headers, timeout=60):
+        calls.append(arguments)
+        if arguments["action"] == "list":
+            return {"ok": True, "http_status": 200, "result": {
+                "knowledge_bases": [{"id": "kb-9", "name": "K"}]}}
+        return {"ok": True, "http_status": 200, "result": {"knowledge_base": {
+            "parser_engines": {"engines": [{"name": "builtin", "available": True}]}}}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.get("/api/parser-engines", headers=HEADERS)
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert calls[0] == {"action": "list"}
+    assert calls[1]["knowledge_base_id"] == "kb-9"
+
+
 def test_parser_engines_requires_identity(client):
     assert client.get("/api/parser-engines").status_code == 400
 
 
-def test_import_forwards_process_config(client, monkeypatch):
+def test_ingest_submits_base64_with_process_config(client, monkeypatch):
+    import base64
     seen = {}
     async def fake_call(name, arguments, headers, timeout=60):
+        assert name == "ingest_document"
         seen.update(arguments)
-        return {"ok": True, "http_status": 200, "result": {"accepted": True}}
+        return {"ok": True, "http_status": 200,
+                "result": {"ingest_id": "i-1", "stage": "queued"}}
     monkeypatch.setattr(webapp, "_call_tool", fake_call)
-    r = client.post("/api/import", headers=HEADERS, json={
-        "knowledge_base_id": "kb-1", "upload_id": "u-1",
-        "process_config": {"parser_engine_rules": [{"file_types": ["pdf"], "engine": "builtin"}]},
-    })
+    payload = b"%PDF-1.4 acceptance"
+    headers = dict(HEADERS)
+    headers["Idempotency-Key"] = "idem-1"
+    r = client.post("/api/ingest", headers=headers,
+                    data={"knowledge_base_id": "kb-1",
+                          "process_config": json.dumps({"parser_engine_rules": [
+                              {"file_types": ["pdf"], "engine": "builtin"}]})},
+                    files={"file": ("a.pdf", payload, "application/pdf")})
     assert r.status_code == 200
+    assert r.json()["result"]["ingest_id"] == "i-1"
+    assert seen["action"] == "submit"
+    assert seen["knowledge_base_id"] == "kb-1"
+    assert seen["idempotency_key"] == "idem-1"
+    assert seen["file"] == {"name": "a.pdf", "encoding": "base64",
+                            "content": base64.b64encode(payload).decode("ascii")}
     assert seen["process_config"]["parser_engine_rules"][0]["engine"] == "builtin"
+
+
+def test_ingest_status_forwards_both_ids(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        assert name == "ingest_document"
+        seen.update(arguments)
+        return {"ok": True, "http_status": 200, "result": {"phases": {"parse": "completed"}}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.get("/api/ingest_status?ingest_id=i-1&document_id=doc-1", headers=HEADERS)
+    assert r.status_code == 200
+    assert seen == {"action": "status", "ingest_id": "i-1", "document_id": "doc-1"}
 
 
 def test_ask_forwards_the_native_mode(client, monkeypatch):
