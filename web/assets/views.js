@@ -7,7 +7,7 @@
 
   /* ===================== 视图一：资料与解析验证 ===================== */
   const M = {
-    file: null, channel: "tool", receipt: null, doc: null,
+    file: null, receipt: null, doc: null,
     steps: [], summary: null, mounted: false, idemAuto: true,
   };
 
@@ -38,17 +38,13 @@
 function materialsMount(section) {
     section.innerHTML = `
       <div class="card">
-        <h3><span class="step-no">1</span>上传你的资料</h3>
-        <div class="sub">文件上传到「目标知识库」——本次上传、导入与状态查询只作用于它。上传通道只决定字节如何送达 WeKnora，解析方式在下一步单独选择。</div>
+        <h3><span class="step-no">1</span>选择资料</h3>
+        <div class="sub">文件上传到「目标知识库」——本次导入与状态查询只作用于它。上传与导入由一次
+        MCP <span class="mono">ingest_document.submit</span> 完成（字节随请求 base64 发送）；解析方式在下一步选择。</div>
         <div class="row">
           <label class="field grow"><span>目标知识库（本次上传目标）</span>
             <select id="m-kb" class="input"></select></label>
-          <button id="m-kb-new" class="btn ghost small" title="经 MCP create_knowledge_base 新建">＋ 新建知识库</button>
-          <label class="field"><span>上传通道</span>
-            <div class="seg" id="m-channel">
-              <button data-ch="tool" class="on">标准 MCP 工具</button>
-              <button data-ch="multipart">文件流（兼容）</button>
-            </div></label>
+          <button id="m-kb-new" class="btn ghost small" title="经 MCP knowledge_base.create 新建">＋ 新建知识库</button>
         </div>
         <div class="row">
           <div id="m-drop" class="dropzone grow">
@@ -58,10 +54,6 @@ function materialsMount(section) {
             <div class="name hidden" id="m-file-name"></div>
           </div>
           <input type="file" id="m-file" class="hidden" accept=".txt,.md,.markdown,.docx,.pdf">
-        </div>
-        <div class="row">
-          <button id="m-upload" class="btn">上传</button>
-          <span id="m-upload-status" class="status-line"></span>
         </div>
         <div id="m-receipt"></div>
         <details class="token-help"><summary>高级：上传请求标识（不理解就别改）</summary>
@@ -76,7 +68,7 @@ function materialsMount(section) {
 
       <div class="card">
         <h3><span class="step-no">2</span>解析方式</h3>
-        <div class="sub">选项来自本部署真实的解析引擎目录（MCP <span class="mono">list_parser_engines</span>）。默认沿用知识库配置；
+        <div class="sub">选项来自 <span class="mono">knowledge_base.get</span> 返回的解析引擎目录。默认沿用知识库配置；
         若与既有文档内容相同被去重，会复用旧解析结果，本次选项不会重新应用。</div>
         <div class="row">
           <label class="field grow"><span>解析引擎</span><select id="m-engine" class="input"></select></label>
@@ -85,10 +77,10 @@ function materialsMount(section) {
       </div>
 
       <div class="card">
-        <h3><span class="step-no">3</span>导入并解析</h3>
-        <div class="sub">由 WeKnora 完成解析与索引。下面会实时显示解析/索引进度、请求与实际使用的引擎，解析完成后给出分块数与原文预览。</div>
+        <h3><span class="step-no">3</span>上传并解析</h3>
+        <div class="sub">一次提交由 WeKnora 完成上传、导入、解析与索引。下面会实时显示各阶段进度、请求与实际使用的引擎，解析完成后给出分块数与原文预览。</div>
         <div class="row">
-          <button id="m-import" class="btn" disabled>导入</button>
+          <button id="m-ingest" class="btn">上传并导入</button>
           <span class="kv">document：<b id="m-doc" class="mono">–</b></span>
           <span class="grow"></span>
           <button id="m-recent" class="btn ghost small">查看知识库最近导入</button>
@@ -98,14 +90,6 @@ function materialsMount(section) {
         <div id="m-recent-list"></div>
       </div>
     `;
-
-    // --- 通道切换 ---
-    section.querySelectorAll("#m-channel button").forEach(btn => {
-      btn.onclick = () => {
-        M.channel = btn.dataset.ch;
-        section.querySelectorAll("#m-channel button").forEach(b => b.classList.toggle("on", b === btn));
-      };
-    });
 
     // --- 目标知识库（单选框，与顶栏只读摘要联动）---
     section.querySelector("#m-kb").onchange = e => {
@@ -153,44 +137,52 @@ function materialsMount(section) {
     };
     renderEngineNote(section);
 
-    // --- 上传 ---
-    section.querySelector("#m-upload").onclick = async () => {
+    // --- 上传并导入（一次 ingest_document.submit）---
+    section.querySelector("#m-ingest").onclick = async () => {
       const epoch = captureIdentityEpoch();
-      const st = section.querySelector("#m-upload-status");
+      const st = section.querySelector("#m-import-status");
       const kb = section.querySelector("#m-kb").value;
       if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
       if (!kb) { st.textContent = "请选择目标知识库"; st.classList.add("err"); return; }
       if (!M.file) { st.textContent = "请选择文件"; st.classList.add("err"); return; }
       st.classList.remove("err");
-      const channelCN = M.channel === "tool" ? "标准 MCP 工具" : "文件流";
+      // 解析方式随 submit 的 process_config 一起提交：只对本次导入生效。
+      let processConfig = null;
+      const engine = section.querySelector("#m-engine").value;
+      if (engine && engine !== "__default__") {
+        const ext = (String(M.file.name || "").split(".").pop() || "pdf").toLowerCase();
+        processConfig = { parser_engine_rules: [{ file_types: [ext], engine }] };
+      }
       // 最多两次：上传标识冲突时自动换一个新的标识重试一次（同一标识配不同
       // 字节/知识库会被服务端按幂等契约拒绝，换文件本就不该沿用旧标识）。
       for (let attempt = 1; attempt <= 2; attempt++) {
         const idem = section.querySelector("#m-idem").value.trim();
-        st.textContent = `上传中（${channelCN}）…`;
+        st.textContent = "上传并导入中（ingest_document.submit）…";
         const fd = new FormData();
-        // 字段顺序即契约：knowledge_base_id 必须排在 file 之前。
         fd.append("knowledge_base_id", kb);
         fd.append("file", M.file, M.file.name);
-        const path = `/api/upload?channel=${encodeURIComponent(M.channel)}`;
+        if (processConfig) fd.append("process_config", JSON.stringify(processConfig));
         const headers = Object.assign(materialsHeaders(), idem ? { "Idempotency-Key": idem } : {});
-        const r = await api(path, {
+        const r = await api("/api/ingest", {
           method: "POST", body: fd, headers,
-          brief: `上传 ${M.file.name}`,
+          brief: `上传并导入 ${M.file.name}`,
         });
-        // 旧身份的上传回执不得写进新身份的面板。
         if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
         const d = r.data || {};
-        // 两条通道的回执形状：multipart={success,data:{...}}；tool={ok,result:{...}}
-        const receipt = d.data || d.result || null;
-        if (r.ok && receipt && (receipt.upload_id || (receipt.receipt && receipt.receipt.upload_id))) {
-          const rr = receipt.receipt || receipt;
-          M.receipt = Object.assign({ channel: M.channel, kb }, rr);
-          st.textContent = "上传成功";
+        const res = d.result || null;
+        if (r.ok && d.ok && res && res.ingest_id) {
+          M.receipt = Object.assign({ kb }, res);
+          M.doc = { id: res.document_id || "", title: res.file_name || M.file.name };
+          M.docStartedAt = Date.now();
+          M.preview = null;
+          section.querySelector("#m-doc").textContent = M.doc.id || "–";
+          const applied = res.process_config_applied;
+          st.textContent = `已提交（stage=${res.stage || "queued"} queued=${res.queued} dedup=${res.deduplicated}` +
+            (applied === undefined ? "" : ` · 解析选项${applied ? "已提交" : "未重新应用"}`) + "）";
+          if (res.note && applied === false) st.textContent += " — " + res.note;
           renderReceipt(section);
           saveLastImport();
-          section.querySelector("#m-import").disabled = false;
-          section.querySelector("#m-import-status").textContent = "";
+          pollIngest(section);
           return;
         }
         if (attempt === 1 && M.idemAuto && isIdempotencyConflict(d, r)) {
@@ -198,45 +190,10 @@ function materialsMount(section) {
           st.textContent = "这个上传标识已用于另一份文件，已自动换新标识并重试…";
           continue;
         }
-        st.textContent = "上传失败：" + uploadErrorText(d, r);
+        st.textContent = "上传并导入失败：" + uploadErrorText(d, r);
         st.classList.add("err");
         return;
       }
-    };
-
-    // --- 导入（带上解析方式）---
-    section.querySelector("#m-import").onclick = async () => {
-      const epoch = captureIdentityEpoch();
-      const st = section.querySelector("#m-import-status");
-      if (!M.receipt) { st.textContent = "请先上传"; st.classList.add("err"); return; }
-      st.classList.remove("err");
-      st.textContent = "导入中（import_document_file）…";
-      const args = { knowledge_base_id: M.receipt.kb, upload_id: M.receipt.upload_id };
-      const engine = section.querySelector("#m-engine").value;
-      if (engine && engine !== "__default__") {
-        const ext = (String(M.receipt.file_name || "").split(".").pop() || "pdf").toLowerCase();
-        args.process_config = { parser_engine_rules: [{ file_types: [ext], engine }] };
-      }
-      const r = await api("/api/import", {
-        method: "POST", json: args, headers: materialsHeaders(), brief: "import_document_file",
-      });
-      if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
-      const res = (r.data && r.data.result) || {};
-      const doc = res.document || {};
-      if (!r.ok || !(r.data && r.data.ok)) {
-        st.textContent = "导入失败：" + ((r.data && r.data.error) || r.error || r.status);
-        st.classList.add("err");
-        return;
-      }
-      M.doc = { id: doc.id || res.document_id || "", title: doc.title || "" };
-      M.docStartedAt = Date.now();
-      section.querySelector("#m-doc").textContent = M.doc.id || "–";
-      const applied = res.process_config_applied;
-      st.textContent = `已入队（queued=${res.queued} dedup=${res.deduplicated}` +
-        (applied === undefined ? "" : ` · 解析选项${applied ? "已提交" : "未重新应用"}`) + "）";
-      if (res.note && applied === false) st.textContent += " — " + res.note;
-      saveLastImport();
-      pollDocStatus(section);
     };
 
     // --- 新建知识库（建完自动刷新列表并选中）---
@@ -262,7 +219,7 @@ function materialsMount(section) {
       box.appendChild(h);
       const sub = document.createElement("div");
       sub.className = "sub";
-      sub.textContent = "经 MCP create_knowledge_base 创建：语义检索与关键词检索默认开启，Wiki / 图谱按需勾选。";
+      sub.textContent = "经 MCP knowledge_base.create 创建：语义检索与关键词检索默认开启，Wiki / 图谱按需勾选。";
       box.appendChild(sub);
 
       const mkField = (label, placeholder, id) => {
@@ -362,7 +319,7 @@ function materialsMount(section) {
         ok.textContent = "创建中…";
         const r = await api("/api/tool", {
           method: "POST",
-          json: { name: "create_knowledge_base", arguments: createArgs },
+          json: { name: "knowledge_base", arguments: Object.assign({ action: "create" }, createArgs) },
           headers: mcpHeaders(), brief: "新建知识库",
         });
         if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
@@ -439,7 +396,7 @@ function materialsMount(section) {
     if (!chosen) {
       note.textContent = S.engines.length
         ? `可选引擎 ${S.engines.filter(e => e.available).length} 个（当前使用知识库默认）`
-        : "解析引擎目录不可用：端点未开放 list_parser_engines，将使用知识库默认";
+        : "解析引擎目录不可用：knowledge_base.get 未返回解析器目录，将使用知识库默认";
     } else {
       note.textContent = `将以 ${chosen} 解析${info && info.file_types ? "（支持 " + info.file_types.join("/") + "）" : ""}；仅对本次导入生效`;
     }
@@ -473,12 +430,12 @@ function materialsMount(section) {
     M.docStartedAt = rec.at || null;   // 刷新后「已等待」从原始导入时间继续算
     if (rec.engine) M.engine = rec.engine;
     renderReceipt(section);
-    section.querySelector("#m-import").disabled = false;
+    section.querySelector("#m-ingest").disabled = false;
     const st = section.querySelector("#m-import-status");
-    st.textContent = "已恢复上次导入记录（刷新前上传/导入的内容），下面显示它当前的状态";
-    if (M.doc && M.doc.id) {
-      section.querySelector("#m-doc").textContent = M.doc.id;
-      pollDocStatus(section);
+    st.textContent = "已恢复上次导入记录（刷新前提交的内容），下面显示它当前的状态";
+    if ((M.receipt && M.receipt.ingest_id) || (M.doc && M.doc.id)) {
+      section.querySelector("#m-doc").textContent = (M.doc && M.doc.id) || "–";
+      pollIngest(section);
     }
   }
 
@@ -486,7 +443,8 @@ function materialsMount(section) {
     pending: "排队中", queued: "排队中", running: "解析中", parsing: "解析中", processing: "解析中",
     indexing: "索引中", finalizing: "收尾中", summarizing: "生成摘要中",
     completed: "已完成", success: "已完成", failed: "失败", cancelled: "已取消",
-    disabled: "已停用", empty: "无",
+    disabled: "已停用", empty: "无", unknown: "未知",
+    staged: "已暂存", imported: "已导入", expired: "已过期",
   };
   function parseStatusCN(s) {
     const key = String(s || "").toLowerCase();
@@ -497,42 +455,52 @@ function materialsMount(section) {
   // docPollSeq：新的轮询或新的文档会让旧的循环立刻退出，避免两个循环互相覆盖。
   let docPollSeq = 0;
 
-  // pollDocStatus 轮询解析状态并回显 requested / applied 引擎，导入后可见。
-  async function pollDocStatus(section) {
+  // pollIngest 轮询 ingest_document.status：上传/解析/索引分阶段回报，
+  // 并回显 requested / applied 引擎。提交后即可见。
+  async function pollIngest(section) {
     const box = section.querySelector("#m-doc-status");
+    const ingestId = M.receipt && M.receipt.ingest_id;
     const docId = M.doc && M.doc.id;
-    if (!box || !docId) return;
+    if (!box || (!ingestId && !docId)) return;
     const seq = ++docPollSeq;
     const epoch = captureIdentityEpoch();
     // 有原始导入时间就接着它算等待时长（刷新后不清零）。
     const startedAt = M.docStartedAt || Date.now();
     M.docStartedAt = startedAt;
     let preview = M.preview && M.preview.id === docId ? M.preview : null;
+    const query = new URLSearchParams();
+    if (ingestId) query.set("ingest_id", ingestId);
+    if (docId) query.set("document_id", docId);
     for (let i = 0; i < 100; i++) {
-      const r = await api(`/api/document_status?knowledge_id=${encodeURIComponent(docId)}`,
+      const r = await api(`/api/ingest_status?${query}`,
         { headers: materialsHeaders(), brief: getDocTitle() });
       if (!isCurrentIdentityEpoch(epoch) || r.stale || seq !== docPollSeq) return;
-      const status = ((r.data || {}).result || {}).status || {};
-      const done = doneStatus(status.parse_status);
+      const data = r.data || {};
+      const result = data.result || {};
+      const phases = result.phases || {};
+      const status = result.document || {};
+      const done = doneStatus(phases.parse);
       if (done && !preview) {
         preview = await readDocPreview(section, docId, epoch, seq);
         M.preview = preview ? Object.assign({ id: docId }, preview) : null;
       }
       if (seq !== docPollSeq) return;
+      M.lastPhases = phases;
       renderDocProgress(section, status, {
         elapsed: Math.round((Date.now() - startedAt) / 1000),
-        preview, done, timedOut: false,
+        preview, done, timedOut: false, phases,
       });
       if (done) return;
       await new Promise(res => setTimeout(res, i < 5 ? 1500 : 3000));
     }
     if (seq !== docPollSeq) return;
     const last = M.lastStatus || {};
-    renderDocProgress(section, last, { elapsed: 300, preview, done: false, timedOut: true });
+    renderDocProgress(section, last, { elapsed: 300, preview, done: false,
+                                       timedOut: true, phases: M.lastPhases || {} });
   }
 
   function getDocTitle() {
-    return (M.doc && M.doc.title) || (M.receipt && M.receipt.file_name) || "document status";
+    return (M.doc && M.doc.title) || (M.receipt && M.receipt.file_name) || "ingest status";
   }
 
   // readDocPreview 读回解析结果的头一段：分块数 + 原文前 200 字，
@@ -540,12 +508,12 @@ function materialsMount(section) {
   async function readDocPreview(section, docId, epoch, seq) {
     const r = await api("/api/tool", {
       method: "POST",
-      json: { name: "read_document", arguments: { knowledge_id: docId, limit: 1 } },
+      json: { name: "read_document", arguments: { action: "read", knowledge_id: docId, limit: 1 } },
       headers: materialsHeaders(), brief: "读取解析结果",
     });
     if (!isCurrentIdentityEpoch(epoch) || r.stale || seq !== docPollSeq) return null;
     if (!r.ok || !(r.data && r.data.ok)) return { total: null, text: "", error: (r.data && r.data.error) || r.error };
-    const d = (r.data.result) || {};
+    const d = ((r.data.result) || {}).document || {};
     const chunk = (d.chunks || [])[0] || {};
     return {
       total: d.total_chunks != null ? d.total_chunks : ((d.document || {}).chunk_count ?? null),
@@ -569,7 +537,9 @@ function materialsMount(section) {
         ? `✅ 解析完成（${ctx.elapsed}s）· 索引${parseStatusCN(idx)}，可去「知识问答」提问`
         : `⚠️ 解析${parseStatusCN(parse)}`)
       : `⏳ 解析中，已等待 ${ctx.elapsed}s（4 页扫描件通常 1–2 分钟）`;
+    const phases = ctx.phases || {};
     const cells = [
+      ["上传", parseStatusCN(phases.upload || "unknown")],
       ["解析", parseStatusCN(parse)],
       ["索引", parseStatusCN(idx)],
       ["请求引擎", requested],
@@ -597,16 +567,16 @@ function materialsMount(section) {
           <button id="m-status-forget" class="btn ghost small">清除这条记录</button>
         </div>
       </div>`;
-    box.querySelector("#m-status-refresh").onclick = () => pollDocStatus(section);
+    box.querySelector("#m-status-refresh").onclick = () => pollIngest(section);
     box.querySelector("#m-status-forget").onclick = () => {
       docPollSeq++;              // 让在飞的轮询循环退出
       clearLastImport();
-      M.receipt = null; M.doc = null; M.preview = null;
+      M.receipt = null; M.doc = null; M.preview = null; M.lastPhases = null;
       section.querySelector("#m-receipt").innerHTML = "";
       section.querySelector("#m-doc").textContent = "–";
       section.querySelector("#m-import-status").textContent = "";
       section.querySelector("#m-doc-status").innerHTML = "";
-      section.querySelector("#m-import").disabled = true;
+      section.querySelector("#m-ingest").disabled = true;
     };
   }
 
@@ -619,11 +589,13 @@ function materialsMount(section) {
     box.innerHTML = '<div class="kv">查询中…</div>';
     const r = await api("/api/tool", {
       method: "POST",
-      json: { name: "list_documents", arguments: { knowledge_base_id: kb, page_size: 8 } },
+      json: { name: "read_document",
+              arguments: { action: "list", knowledge_base_id: kb, page_size: 8 } },
       headers: materialsHeaders(), brief: "列出最近导入",
     });
     if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
-    const docs = ((r.data && r.data.result) || {}).documents || [];
+    const block = ((r.data && r.data.result) || {}).documents || {};
+    const docs = block.documents || [];
     if (!r.ok || !(r.data && r.data.ok)) {
       box.innerHTML = `<div class="kv err-text">查询失败：${escapeHtml(String((r.data && r.data.error) || r.error))}</div>`;
       return;
@@ -645,7 +617,7 @@ function materialsMount(section) {
         section.querySelector("#m-import-status").textContent = `正在查看：${M.doc.title || M.doc.id}`;
         section.querySelector("#m-recent-list").innerHTML = "";
         saveLastImport();
-        pollDocStatus(section);
+        pollIngest(section);
       };
     });
   }
@@ -657,11 +629,11 @@ function materialsMount(section) {
     if (!r) { box.innerHTML = ""; return; }
     box.innerHTML = `
       <div class="receipt">
-        <div class="kv">通道 <b>${escapeHtml(r.channel)}</b> · upload_id <b class="mono">${escapeHtml(r.upload_id || "")}</b>
-        ${r.replay ? '· <b>replay=true</b>（幂等重放）' : ""}</div>
-        <div class="kv">file <b>${escapeHtml(r.file_name || "")}</b> · size <b>${r.file_size ?? "?"}</b> ·
-        sha256 <span class="mono">${escapeHtml(String(r.sha256 || "").slice(0, 16))}…</span> ·
-        expires <b>${escapeHtml(String(r.expires_at || "").slice(0, 19))}</b></div>
+        <div class="kv">ingest_id <b class="mono">${escapeHtml(r.ingest_id || "")}</b> ·
+        upload_id <b class="mono">${escapeHtml(r.upload_id || "")}</b> ·
+        stage <b>${escapeHtml(r.stage || "–")}</b></div>
+        <div class="kv">file <b>${escapeHtml(r.file_name || "")}</b> · size <b>${r.file_size ?? "?"}</b>
+        ${r.deduplicated ? "· <b>dedup=true</b>（同内容复用旧解析）" : ""}</div>
       </div>`;
   }
 
@@ -672,8 +644,8 @@ function materialsMount(section) {
     if (!kb) { toast("请选择目标知识库", "err"); return; }
     if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
     const body = { knowledge_base_id: kb };
-    if (M.doc && M.doc.id) body.knowledge_id = M.doc.id;
-    if (M.receipt) body.upload_id = M.receipt.upload_id;
+    if (M.doc && M.doc.id) body.document_id = M.doc.id;
+    if (M.receipt && M.receipt.ingest_id) body.ingest_id = M.receipt.ingest_id;
     const table = section.querySelector("#m-checklist");
     const summaryEl = section.querySelector("#m-summary");
     M.steps = []; M.summary = null;
@@ -705,7 +677,7 @@ function materialsMount(section) {
           holder.appendChild(pre);
           tr.querySelector(".raw-toggle").onclick = () => holder.classList.toggle("hidden");
           tbody.appendChild(tr);
-          if (evt.tool === "get_document_status") {
+          if (evt.tool === "ingest_document.status") {
             const p = table.querySelector("#m-cl-progress");
             if (p) p.textContent = evt.status === "pass" ? "解析完成。" : `解析状态：${evt.summary || ""}`;
           }
@@ -820,8 +792,8 @@ function materialsMount(section) {
           <span class="kv">session：<b id="qa-session" class="mono">–</b></span>
           <button id="qa-new" class="btn ghost small">新会话</button>
         </div>
-        <div class="sub" id="qa-hint">模式经 MCP <span class="mono">ask</span> 的 mode 参数提交，由 WeKnora 校验生效；
-        「端点默认」使用端点配置的 agent（本控制台只走 WeKnora 自己的问答链，不再内置其他编排框架）。</div>
+        <div class="sub" id="qa-hint">问答经五工具核心的 <span class="mono">ask</span> 提交（<span class="mono">/mcp/core/:id</span>），
+        mode 由 WeKnora 校验生效；「端点默认」使用端点配置的问答档案（本控制台只走 WeKnora 自己的问答链，不再内置其他编排框架）。</div>
       </div>
       <div id="qa-msgs"><div class="empty">还没有对话。选择范围后输入问题开始。</div></div>
       <div class="card">
@@ -1039,13 +1011,12 @@ function materialsMount(section) {
   const B = { tool: null, mounted: false, formMode: "form", formInputs: {}, jsonText: "" };
 
   function groupOf(name) {
-    if (name.startsWith("wiki_")) return "Wiki";
-    if (name.includes("graph")) return "图谱";
-    if (name.includes("status")) return "状态";
-    if (name.includes("upload") || name.includes("import")) return "上传 / 导入";
-    if (name.includes("document") && (name.startsWith("add") || name.startsWith("update") || name.startsWith("delete"))) return "写操作";
-    if (name === "list_knowledge_bases" || name === "list_documents") return "发现";
-    return "检索 / 读取";
+    if (name === "knowledge_base") return "知识库";
+    if (name === "ingest_document") return "导入 / 状态";
+    if (name === "search_knowledge") return "检索";
+    if (name === "read_document") return "读取";
+    if (name === "ask") return "问答";
+    return "其他";
   }
 
   function benchMount(section) {
@@ -1059,7 +1030,8 @@ function materialsMount(section) {
       <div class="bench">
         <div class="card">
           <h3>工具目录</h3>
-          <div class="sub">共 <b id="b-count">0</b> 个工具，来自 MCP <span class="mono">tools/list</span>（配置 Token 后加载）。标「写」的会修改知识库数据，运行前会二次确认。</div>
+          <div class="sub">共 <b id="b-count">0</b> 个工具，来自五工具知识核心的 <span class="mono">tools/list</span>
+          （<span class="mono">/mcp/core/:id</span>，配置 Token 后加载）。标「写」的会修改知识库数据，运行前会二次确认。</div>
           <input id="b-filter" class="input wide" placeholder="按中文名或工具名过滤…">
           <div class="tool-list" id="b-list" style="margin-top:10px"></div>
         </div>
@@ -1069,7 +1041,8 @@ function materialsMount(section) {
       </div>
       <div class="card">
         <h3>MCP 验证清单</h3>
-        <div class="sub">对着「上传目标知识库」（或最近导入的那篇文档）把只读工具跑一遍：查状态 → 读原文 → 列文档 → 检索 → Wiki → 图谱 → 知识库状态。
+        <div class="sub">对着「上传目标知识库」（或最近导入的那篇文档）把五工具核心的读取动作跑一遍：
+        知识库列表/详情 → 导入状态 → 读原文 → 列文档 → 检索（含字面匹配）→ Wiki 目录/页面 → Wiki 检索 → 图谱检索。
         知识库没开启的能力会自动跳过并写明原因；红色叉才是工具本身失败。</div>
         <div class="row">
           <button id="m-run-checklist" class="btn ghost">运行 / 重跑清单</button>
@@ -1092,8 +1065,8 @@ function materialsMount(section) {
       generated_at: new Date().toISOString(),
       endpoint: (S.endpoint && S.endpoint.endpoint_id) || "",
       knowledge_base_id: (M.receipt && M.receipt.kb) || S.uploadTargetKbId || "",
-      knowledge_id: (M.doc && M.doc.id) || "",
-      upload_id: (M.receipt && M.receipt.upload_id) || "",
+      document_id: (M.doc && M.doc.id) || "",
+      ingest_id: (M.receipt && M.receipt.ingest_id) || "",
       summary: M.summary, steps: M.steps,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -1207,6 +1180,9 @@ function materialsMount(section) {
       } else if (spec.type === "array") {
         el = document.createElement("textarea"); el.className = "input wide mono"; el.rows = 2;
         el.placeholder = "每行一个值（或逗号分隔）";
+      } else if (spec.type === "object") {
+        el = document.createElement("textarea"); el.className = "input wide mono"; el.rows = 4;
+        el.placeholder = '{"name":"example.pdf","encoding":"base64","content":"..."}';
       } else if (["content", "question", "text", "query"].includes(name) || (spec.type === "string" && (spec.maxLength || 0) > 500)) {
         el = document.createElement("textarea"); el.className = "input wide"; el.rows = 3;
       } else {
@@ -1231,6 +1207,9 @@ function materialsMount(section) {
         args[name] = raw.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
       } else if (spec.type === "number" || spec.type === "integer") {
         args[name] = Number(raw);
+      } else if (spec.type === "object") {
+        try { args[name] = JSON.parse(raw); }
+        catch (_) { throw new Error(`${fieldCN(name) || name} 必须是合法 JSON`); }
       } else {
         args[name] = raw;
       }
@@ -1242,28 +1221,11 @@ function materialsMount(section) {
 
   // TOOL_EXAMPLE_NOTE 说明点「填入示例」后跑出来的是什么，方便演示时讲。
   const TOOL_EXAMPLE_NOTE = {
-    list_knowledge_bases: "当前身份可见的知识库，以及每个库开启了哪些能力。",
-    create_knowledge_base: "新建一个知识库（默认开语义 + 关键词，可勾选 Wiki / 图谱），返回它的 id。",
-    list_parser_engines: "本部署真实可用的解析引擎，以及各自支持的文件类型。",
-    list_documents: "目标知识库里最近的文档（含解析状态）。",
-    get_document_status: "某篇文档的解析/索引进度，以及请求与实际使用的解析引擎。",
-    read_document: "某篇文档解析出来的正文（示例取第 1 段）。",
-    search_knowledge: "语义+关键词检索的命中分块与来源文档。",
-    grep_chunks: "在分块里做字面匹配的结果，适合核对编号、金额。",
+    knowledge_base: "当前身份可见的知识库，以及每个库开启了哪些能力（list 动作）。",
+    ingest_document: "复用资料页最近一次提交的 ingest_id，查询上传/解析/索引各阶段。",
+    search_knowledge: "在目标知识库里做混合检索，返回命中的分块与来源文档。",
+    read_document: "读回目标知识库最近一篇文档的正文（取第 1 段）。",
     ask: "一次原生问答，返回带引用的回答。",
-    get_knowledge_base_status: "知识库规模与能力可用性（文档数、分块数、Wiki/图谱是否就绪）。",
-    get_upload_status: "某个 upload_id 的暂存状态。",
-    upload_file: "把一段 Markdown 文本作为文件暂存，返回 upload_id。",
-    import_document_file: "把暂存的文件变成正式文档并触发解析。",
-    add_document: "新建一篇 Markdown 文档（会真的写进知识库）。",
-    update_document: "替换某篇文档的正文，随后重新索引。",
-    delete_document: "删除文档及其索引（不可撤销，示例指向演示文档）。",
-    wiki_index: "Wiki 的分组与页面清单。",
-    wiki_list_pages: "按类型/状态分页列出 Wiki 页面。",
-    wiki_read_page: "单个 Wiki 页面的正文与引用。",
-    wiki_search: "在 Wiki 页面里检索。",
-    wiki_graph: "Wiki 页面之间的关系边。",
-    query_knowledge_graph: "知识图谱的实体/关系（该库没开启图谱时返回空）。",
   };
 
   // EX 缓存示例用到的真实 id，避免每次点「填入示例」都重查一遍。
@@ -1284,16 +1246,12 @@ function materialsMount(section) {
       : !!(k.capability_flags || {})[capability]);
   }
 
-  function exampleKbFor(capability) {
-    const capable = capableKbs(capability);
-    // 当前上传目标如果有这项能力就用它（演示时选中的库优先），否则挑第一个具备的。
-    return capable.find(k => k.id === S.uploadTargetKbId) || capable[0] || null;
-  }
 
-  function capabilityHint(toolName, errorText) {
+  function capabilityHint(toolName, args, errorText) {
     const text = String(errorText || "");
-    const needsGraph = /graph/i.test(toolName) || /GRAPH_/.test(text);
-    const needsWiki = /^wiki_/.test(toolName);
+    const sources = (args && args.sources) || [];
+    const needsGraph = sources.includes("graph") || /GRAPH_/.test(text);
+    const needsWiki = sources.includes("wiki") || /wiki/i.test(` ${toolName} ${text}`);
     if (!needsGraph && !needsWiki) return "";
     const cap = needsGraph ? "graph" : "wiki";
     const label = cap === "graph" ? "知识图谱" : "Wiki";
@@ -1313,10 +1271,13 @@ function materialsMount(section) {
   async function exampleNewestDoc(kbId) {
     if (EX.kbId === kbId && EX.docId) return EX;
     const r = await api("/api/tool", {
-      method: "POST", json: { name: "list_documents", arguments: { knowledge_base_id: kbId, page_size: 5 } },
+      method: "POST",
+      json: { name: "read_document",
+              arguments: { action: "list", knowledge_base_id: kbId, page_size: 5 } },
       headers: materialsHeaders(), brief: "取示例文档",
     });
-    const docs = ((r.data && r.data.result) || {}).documents || [];
+    const block = ((r.data && r.data.result) || {}).documents || {};
+    const docs = block.documents || [];
     const picked = docs.find(d => d.parse_status === "completed") || docs[0];
     if (picked) {
       EX.kbId = kbId;
@@ -1332,128 +1293,43 @@ function materialsMount(section) {
     return EX;
   }
 
-  function wikiExampleKb() {
-    const kb = exampleKbFor("wiki");
-    if (!kb) {
-      throw new Error("当前可见的知识库里没有开启 Wiki 的；可在「资料解析」页新建一个" +
-        "（勾选「同时生成 Wiki 页面」）并上传资料，等解析完成后再试");
-    }
-    return kb;
-  }
-
-  function examplePlainText() {
-    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
-    return "# 控制台演示文档\n\n这是 " + stamp + " 由控制台通过 MCP add_document 创建的演示内容。\n";
-  }
 
   // resolveToolExample 返回 { args, note }：参数全部来自当前真实状态。
   async function resolveToolExample(name) {
     const kbId = exampleKbId();
-    const kbArgs = { knowledge_base_id: kbId };
     const kbList = { knowledge_base_ids: kbId ? [kbId] : [] };
     switch (name) {
-      case "list_knowledge_bases":
-      case "list_parser_engines":
-        return { args: {} };
-      case "create_knowledge_base":
-        return { args: { name: "演示知识库-" + new Date().toISOString().slice(0, 10),
-                         description: "由控制台通过 MCP 创建", enable_wiki: false, enable_graph: false },
-                 note: "创建成功后新的库会自动加入本端点范围，可以在「资料解析」页直接用它上传。" };
-      case "list_documents":
-        return { args: Object.assign({ page_size: 5 }, kbArgs) };
-      case "get_knowledge_base_status":
-        return { args: Object.assign({}, kbArgs) };
-      case "get_document_status":
+      case "knowledge_base":
+        return { args: { action: "list" },
+                 note: "想看单个库的详情，把 action 改成 get 并填 knowledge_base_id" };
+      case "ingest_document": {
+        const ingestId = (M.receipt && M.receipt.ingest_id) || "";
+        const docId = (M.doc && M.doc.id) || "";
+        if (!ingestId && !docId) {
+          throw new Error("先在「资料解析」页提交一次，示例会复用那次 ingest_id / document_id");
+        }
+        const args = { action: "status" };
+        if (ingestId) args.ingest_id = ingestId;
+        else args.document_id = docId;
+        return { args, note: "查询最近一次导入的上传/解析/索引阶段" };
+      }
+      case "search_knowledge": {
+        await exampleNewestDoc(kbId);
+        return { args: Object.assign({ query: EX.docWord || "验收", sources: ["document"],
+                                       mode: "hybrid", limit: 5 }, kbList),
+                 note: "检索词「" + (EX.docWord || "验收") + "」取自最近文档的标题" };
+      }
       case "read_document": {
         await exampleNewestDoc(kbId);
         if (!EX.docId) throw new Error("目标知识库里还没有文档，先上传一份");
-        const args = { knowledge_id: EX.docId };
-        if (name === "read_document") args.limit = 1;
-        return { args, note: "用的是《" + (EX.docTitle || EX.docId) + "》" };
+        return { args: { action: "read", knowledge_id: EX.docId, limit: 1 },
+                 note: "用的是《" + (EX.docTitle || EX.docId) + "》" };
       }
-      case "search_knowledge":
-        await exampleNewestDoc(kbId);
-        return { args: Object.assign({ query: EX.docWord || "验收", limit: 5 }, kbList),
-                 note: "检索词「" + (EX.docWord || "验收") + "」取自最近文档的标题" };
-      case "grep_chunks":
-        await exampleNewestDoc(kbId);
-        return { args: Object.assign({ query: EX.docWord || "验收", limit: 5 }, kbList) };
       case "ask":
         return { args: { question: "这个知识库里有哪些资料？请按文档分别说明。", mode: "quick-answer" } };
-      case "wiki_index": {
-        const kb = wikiExampleKb();
-        return { args: Object.assign({ limit: 20 }, { knowledge_base_id: kb.id }),
-                 note: `用的是《${kb.name}》（已开启 Wiki）` };
-      }
-      case "wiki_list_pages": {
-        const kb = wikiExampleKb();
-        return { args: Object.assign({ page: 1, page_size: 5 }, { knowledge_base_id: kb.id }),
-                 note: `用的是《${kb.name}》（已开启 Wiki）` };
-      }
-      case "wiki_read_page": {
-        const kb = wikiExampleKb();
-        return { args: { slug: "index", knowledge_base_id: kb.id },
-                 note: `《${kb.name}》的入口页；读别的页面先跑 wiki_index 拿 slug` };
-      }
-      case "wiki_search": {
-        const kb = wikiExampleKb();
-        return { args: Object.assign({ query: EX.docWord || "总结", limit: 5 },
-                                     { knowledge_base_ids: [kb.id] }),
-                 note: `在《${kb.name}》的 Wiki 里检索` };
-      }
-      case "wiki_graph": {
-        const kb = wikiExampleKb();
-        return { args: Object.assign({ limit: 10 }, { knowledge_base_id: kb.id }),
-                 note: `《${kb.name}》的 Wiki 页面关系边` };
-      }
-      case "query_knowledge_graph": {
-        const kb = exampleKbFor("graph");
-        if (!kb) {
-          throw new Error("当前可见的知识库里没有开启知识图谱的；可在「资料解析」页新建一个" +
-            "（勾选「同时抽取知识图谱」）并上传资料，等解析完成后再试");
-        }
-        await exampleNewestDoc(kb.id);
-        return { args: Object.assign({ query: EX.docWord || "项目" }, { knowledge_base_ids: [kb.id] }),
-                 note: `用的是《${kb.name}》（已开启图谱）；刚导入的资料要等解析+抽取完成才有关系` };
-      }
-      case "upload_file":
-        return { args: { knowledge_base_id: kbId, file_name: "console-demo-" + Date.now() + ".md",
-                         content: exampleBase64() },
-                 note: "示例把一段 Markdown 文本当作文件上传；返回的 upload_id 可以接着跑 import_document_file" };
-      case "import_document_file": {
-        const uploadId = (M.receipt && M.receipt.upload_id) || "";
-        if (!uploadId) throw new Error("先在「资料解析」页上传一次，示例会复用那次 upload_id");
-        return { args: { knowledge_base_id: kbId, upload_id: uploadId } };
-      }
-      case "get_upload_status": {
-        const uploadId = (M.receipt && M.receipt.upload_id) || "";
-        if (!uploadId) throw new Error("先上传一次，示例会复用那次 upload_id");
-        return { args: { upload_id: uploadId } };
-      }
-      case "add_document":
-        return { args: { knowledge_base_id: kbId, title: "控制台演示文档 " + new Date().toLocaleTimeString(),
-                         content: examplePlainText() } };
-      case "update_document": {
-        await exampleNewestDoc(kbId);
-        if (!EX.docId) throw new Error("目标知识库里还没有文档");
-        return { args: { knowledge_id: EX.docId, content: examplePlainText() + "\n（由控制台更新）\n" },
-                 note: "会覆盖《" + (EX.docTitle || EX.docId) + "》的正文，仅对 Markdown 文档有效" };
-      }
-      case "delete_document": {
-        await exampleNewestDoc(kbId);
-        if (!EX.docId) throw new Error("目标知识库里还没有文档");
-        return { args: { knowledge_id: EX.docId },
-                 note: "⚠️ 会把《" + (EX.docTitle || EX.docId) + "》删掉且不可撤销；演示前建议先用 add_document 建一篇草稿" };
-      }
       default:
         return { args: {} };
     }
-  }
-
-  // exampleBase64 把演示文本编码成 upload_file 需要的 base64（UTF-8 安全）。
-  function exampleBase64() {
-    const text = examplePlainText();
-    return btoa(unescape(encodeURIComponent(text)));
   }
 
   async function fillToolExample(section, box) {
@@ -1497,7 +1373,8 @@ function materialsMount(section) {
       try { args = JSON.parse(box.querySelector("#b-json-text").value || "{}"); }
       catch (e) { toast("JSON 解析失败：" + e.message, "err"); return; }
     } else {
-      args = readForm();
+      try { args = readForm(); }
+      catch (e) { toast(e.message, "err"); return; }
     }
     if (t.destructive) {
       const okGo = await confirmDialog({
@@ -1516,7 +1393,7 @@ function materialsMount(section) {
                           : `失败：${d.error || r.error || statusCN(r.status)}${d.error_code ? `（${d.error_code}）` : ""}`;
     if (!d.ok) {
       st.classList.add("err");
-      const hint = capabilityHint(t.name, `${d.error_code || ""} ${d.error || ""}`);
+      const hint = capabilityHint(t.name, args, `${d.error_code || ""} ${d.error || ""}`);
       if (hint) st.textContent += " —— " + hint;
     }
     const pane = box.querySelector("#b-result");
@@ -1537,8 +1414,9 @@ function materialsMount(section) {
   const Views = {
     mounted: {},
     onIdentityChanged() {
-      Object.assign(M, { file: null, channel: "tool", receipt: null, doc: null, steps: [], summary: null,
-                            mounted: false, preview: null, lastStatus: null, idemAuto: true });
+      Object.assign(M, { file: null, receipt: null, doc: null, steps: [], summary: null,
+                            mounted: false, preview: null, lastStatus: null, lastPhases: null,
+                            idemAuto: true });
       docPollSeq++;  // 旧身份的轮询循环立即失效
       Object.assign(Q, { sessionId: "", busy: false, mounted: false });
       Object.assign(B, { tool: null, mounted: false });

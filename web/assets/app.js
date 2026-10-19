@@ -5,15 +5,15 @@ const S = {
   accounts: [],           // 服务端账号档案（无密码）
   profiles: [],           // 浏览器本地档案（含 token）
   activeEmail: "",
-  kbs: [],                // list_knowledge_bases 结果
-  tools: [],              // tools/list 结果
+  kbs: [],                // knowledge_base.list 结果
+  tools: [],              // tools/list 结果（五工具 core 面）
   // KB 范围按页面拆分：资料页只有一个上传目标；问答页有自己的检索范围与
   // 原生模式。两者互不干扰，也都不再由顶栏统一编辑。
   uploadTargetKbId: "",   // 资料页：上传/导入/状态请求只带这个库
   qaKbIds: [],            // 问答页：ask/chat 的检索范围（空 = 未选）
   qaScopeAll: false,      // 问答页显式选择「全部可用」时才不收窄
   qaMode: "",             // "" = 端点默认；quick-answer / smart-reasoning
-  engines: [],            // list_parser_engines 结果（资料页解析方式）
+  engines: [],            // knowledge_base.get 的解析器目录（资料页解析方式）
   endpoint: null,
   trace: [],
   ui: { view: "materials" },
@@ -163,45 +163,30 @@ function confirmDialog({ title, message, confirmText = "确认执行", danger = 
  * 这里只是给控制台加一层中文说明，不改变任何对外契约。
  */
 const TOOL_CN = {
-  list_knowledge_bases: ["列出知识库", "当前身份能看到的全部知识库，以及每个库开启了哪些能力（Wiki / 图谱 / 关键词 / 向量）。"],
-  list_parser_engines: ["列出解析引擎", "本部署真实可用的解析引擎目录：支持哪些文件类型、是否可用、不可用时是什么原因。"],
-  list_documents: ["列出文档", "某个知识库里的文档清单，带解析/索引状态，可按关键词过滤并分页。"],
-  read_document: ["读取原文", "按文档 ID 读回解析后的正文（可分页，也可只取与某个查询相关的片段）。"],
-  get_document_status: ["查询文档状态", "单个文档的解析与索引进度，以及「请求的解析引擎」和「实际执行的引擎」。"],
-  get_knowledge_base_status: ["查询知识库状态", "知识库规模与能力可用性：文档数、分块数，Wiki 与图谱是否已就绪。"],
-  get_upload_status: ["查询上传状态", "按 upload_id 查暂存状态（staged / imported / 已过期等）。"],
-  search_knowledge: ["语义检索", "混合检索（向量 + 关键词），返回命中的分块原文和来源文档。"],
-  grep_chunks: ["关键词精确匹配", "在分块里做字面匹配，适合核对编号、金额、口令这类精确字符串。"],
-  ask: ["知识问答", "一次问答：可选原生模式（快速问答 / 智能推理）、可用 session_id 续问，并限定知识库范围。"],
-  wiki_index: ["Wiki 目录", "知识库的 Wiki 总览（分组 + 页面清单），先看它再决定读哪页。"],
-  wiki_list_pages: ["Wiki 页面列表", "按类型与状态分页列出 Wiki 页面。"],
-  wiki_read_page: ["Wiki 读取页面", "读取单个 Wiki 页面正文，带页面的引用关系。"],
-  wiki_search: ["Wiki 检索", "在 Wiki 页面里检索，可选按正则匹配。"],
-  wiki_graph: ["Wiki 关系图", "Wiki 页面之间的关系边，可指定中心页与展开深度。"],
-  query_knowledge_graph: ["知识图谱查询", "按实体或关系查图谱（需要该知识库已开启图谱抽取）。"],
-  upload_file: ["上传文件", "把文件字节（base64）先暂存到知识库，返回 upload_id；同一个请求标识配同一份字节可幂等重放。"],
-  import_document_file: ["导入并解析", "把已暂存的文件变成正式文档并触发解析，可顺便指定解析引擎。"],
-  add_document: ["新建文档", "用 Markdown 文本或网址新建一篇文档。"],
-  update_document: ["更新文档", "替换 Markdown 文档的正文（可同时改标题），之后会重新索引。"],
-  delete_document: ["删除文档", "永久删除文档及其索引数据，不可撤销。"],
+  knowledge_base: ["知识库", "action=list 列出可见知识库（含能力标记）；action=get 查看单个库的状态、解析器目录与已发布问答档案；action=create 新建知识库。"],
+  ingest_document: ["导入文档", "action=submit 一次完成「上传 + 导入 + 解析」：文件字节 base64 随请求发送，可带 process_config 指定解析引擎；action=status 按 ingest_id / document_id 回报上传、解析、索引、Wiki、图谱各阶段。"],
+  search_knowledge: ["检索证据", "在文档、Wiki、知识图谱里检索：sources 选择来源（document / wiki / graph），mode 选混合 / 语义 / 关键词，match=literal 做字面匹配（核对编号、金额）。"],
+  read_document: ["回读原文", "action=list 列出知识库的文档目录或 Wiki 目录；action=read 读回文档正文（可分页）或 Wiki 页面（按 slug），用于核对引用。"],
+  ask: ["知识问答", "WeKnora 原生问答：mode 选快速问答 / 智能推理，profile_id 用端点发布的配置，session_id 续问；返回回答与引用。"],
 };
 const FIELD_CN = {
+  action: "动作",
   knowledge_base_id: "知识库", knowledge_base_ids: "知识库范围", knowledge_id: "文档 ID",
-  upload_id: "上传 ID", file_name: "文件名", content: "内容", title: "标题", url: "网址",
+  ingest_id: "导入 ID", document_id: "文档 ID", source_type: "来源类型", sources: "检索来源",
+  match: "匹配方式", encoding: "编码", file: "文件", name: "名称", description: "描述",
+  enable_wiki: "启用 Wiki", enable_graph: "启用图谱", include_capabilities: "包含能力目录",
+  graph_entities: "图谱实体类型", graph_relations: "图谱关系",
   query: "查询词", limit: "条数上限", offset: "起始位置", page: "页码", page_size: "每页条数",
-  mode: "模式", session_id: "会话 ID", process_config: "解析配置", publish: "立即发布",
-  idempotency_key: "上传请求标识", status: "状态", page_type: "页面类型", center: "中心页面",
-  depth: "展开深度", slug: "页面标识", regex: "按正则匹配", keyword: "关键词",
+  mode: "模式", profile_id: "问答档案", session_id: "会话 ID", process_config: "解析配置",
+  idempotency_key: "上传请求标识", slug: "页面标识", keyword: "关键词",
 };
 const PATH_CN = {
   "/api/kbs": "读取知识库列表",
   "/api/tools": "读取 MCP 工具目录",
   "/api/endpoint": "读取端点信息",
   "/api/parser-engines": "读取解析引擎目录",
-  "/api/upload": "上传文件",
-  "/api/import": "导入并解析",
-  "/api/upload_status": "查询上传状态",
-  "/api/document_status": "查询文档状态",
+  "/api/ingest": "上传并导入（ingest_document.submit）",
+  "/api/ingest_status": "查询导入状态",
   "/api/kb_status": "查询知识库状态",
   "/api/tool": "调用 MCP 工具",
   "/api/checklist": "运行验证清单",
@@ -478,7 +463,7 @@ function renderScopeSummary() {
 async function loadKbs() {
   if (!activeProfile()) { S.kbs = []; renderScopeSummary(); return; }
   const epoch = captureIdentityEpoch();
-  const r = await api("/api/kbs", { brief: "list_knowledge_bases" });
+  const r = await api("/api/kbs", { brief: "knowledge_base.list" });
   if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
   if (r.ok && r.data && r.data.ok) {
     S.kbs = r.data.result.knowledge_bases || [];
@@ -496,20 +481,21 @@ async function loadKbs() {
   if (window.Views && Views.onSelectionChanged) Views.onSelectionChanged();
 }
 
-// loadEngines fetches the deployment's parser catalog through MCP
-// (list_parser_engines). Endpoints that do not expose the tool fall back to
+// loadEngines fetches the deployment's parser catalog through the core
+// knowledge_base.get action. Endpoints that do not expose the underlying
+// get_knowledge_base_status + list_parser_engines permissions fall back to
 // "knowledge base default" instead of blocking the upload page.
 async function loadEngines() {
   S.engines = [];
   if (!activeProfile()) { renderScopeSummary(); return; }
   const epoch = captureIdentityEpoch();
-  const r = await api("/api/parser-engines", { brief: "list_parser_engines" });
+  const r = await api("/api/parser-engines", { brief: "knowledge_base.get（解析引擎）" });
   if (!isCurrentIdentityEpoch(epoch) || r.stale) return;
   if (r.ok && r.data && r.data.ok) {
     S.engines = (r.data.result && r.data.result.engines) || [];
   } else {
     S.engines = [];
-    toast("解析引擎目录不可用（端点未开放 list_parser_engines），将使用知识库默认解析", "err");
+    toast("解析引擎目录不可用（knowledge_base.get 需要状态与解析器目录权限），将使用知识库默认解析", "err");
   }
   if (window.Views && Views.onSelectionChanged) Views.onSelectionChanged();
 }

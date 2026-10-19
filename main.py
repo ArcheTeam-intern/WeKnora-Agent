@@ -53,11 +53,11 @@ def load_connections(path, *, header_overrides=None, core_url=True):
         headers.update(header_overrides)
         conn["headers"] = headers
     expanded = expand(connections)
-    # The LangChain client is the one component where a model picks tools, so it
-    # talks to the five-tool knowledge core (write actions are not on that
-    # surface at all, and agent.py additionally filters to the read-only two).
-    # The console's deterministic flows still call the legacy surface by name,
-    # so they must load the configuration without the rewrite.
+    # Both consumers — the LangChain client and the console's deterministic
+    # flows — talk to the five-tool knowledge core. The core does publish
+    # write actions (knowledge_base.create, ingest_document.submit); the model
+    # never sees them because agent.py filters to the read-only two, and the
+    # console triggers writes only from explicit user actions.
     if not core_url:
         return expanded
     return core_connections(expanded)
