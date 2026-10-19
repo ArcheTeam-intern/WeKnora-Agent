@@ -121,7 +121,8 @@ def _build_connection(endpoint_token: str, user_headers: dict[str, str]):
     requests do not share state.
     """
     return load_connections(ROOT / "mcp.json", header_overrides={
-        "Authorization": "Bearer " + endpoint_token, **user_headers})
+        "Authorization": "Bearer " + endpoint_token, **user_headers},
+        core_url=False)
 
 
 def _endpoint_token() -> str:
@@ -130,8 +131,18 @@ def _endpoint_token() -> str:
 
 
 def _mcp_endpoint_target() -> tuple[str, str]:
-    """Return (weknora_base_url, endpoint_id) from mcp.json / .env."""
-    connections = load_connections(ROOT / "mcp.json", header_overrides={"Authorization": ""})
+    """Return (weknora_base_url, endpoint_id) from mcp.json / .env.
+
+    The console's deterministic flows call the legacy surface (/mcp/<id>),
+    which is where the 22 legacy tool names live. The five-tool knowledge
+    core (/mcp/core/<id>) is only reached through the LangChain agent, which
+    has its own connection rewrite; loading the connections object through
+    the default helper would silently point the console at the core surface
+    and every legacy-named call would answer "tool not found". Read the
+    configuration without the rewrite.
+    """
+    connections = load_connections(ROOT / "mcp.json", header_overrides={"Authorization": ""},
+                                  core_url=False)
     url = (connections["weknora"].get("url") or "").strip()
     endpoint_id = ""
     if "/mcp/" in url:

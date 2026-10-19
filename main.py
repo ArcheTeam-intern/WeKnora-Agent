@@ -23,7 +23,7 @@ def required_env(name):
     return value
 
 
-def load_connections(path, *, header_overrides=None):
+def load_connections(path, *, header_overrides=None, core_url=True):
     # Expand parsed string values, not raw JSON, so quotes/backslashes stay safe.
     def expand(value):
         if isinstance(value, str):
@@ -56,6 +56,10 @@ def load_connections(path, *, header_overrides=None):
     # The LangChain client is the one component where a model picks tools, so it
     # talks to the five-tool knowledge core (write actions are not on that
     # surface at all, and agent.py additionally filters to the read-only two).
+    # The console's deterministic flows still call the legacy surface by name,
+    # so they must load the configuration without the rewrite.
+    if not core_url:
+        return expanded
     return core_connections(expanded)
 
 
