@@ -1019,6 +1019,132 @@ function materialsMount(section) {
     return "其他";
   }
 
+  /* ---- 五工具的使用说明与自测步骤（诊断页展示，中文） ---- */
+  const TOOL_USAGE = {
+    knowledge_base: {
+      purpose: "知识库目录与配置：列库、看单个库的能力与解析器目录、按需建库。其他工具的选库依据都在这里取得。",
+      actions: [
+        ["list", "列出当前身份可见的知识库，含 wiki / graph / vector / keyword 能力标记（真实可用性还要看 graph_ready）。"],
+        ["get", "看一个库的详情：文档数/分块数、Wiki 与图谱的 available 状态、解析引擎目录、端点上已发布的问答档案。"],
+        ["create", "新建知识库：默认开启向量 + 关键词；勾选 Wiki / 图谱时建议同时给出实体类型与关系（否则抽不出关系）。"],
+      ],
+      steps: [
+        "运行 list，确认目标库在范围内，记下 knowledge_base_id（后续所有工具都要用它）。",
+        "对目标库运行 get（include_capabilities=true）：应看到 status.status.documents / chunks，以及 parser_engines.engines 非空。",
+        "如需新库再运行 create；创建成功后回到 list 确认新库已出现、并把「资料解析」页的上传目标切到它。",
+      ],
+      expect: "list 返回 knowledge_bases 非空；get 返回 status.status 计数与 parser_engines.engines；create 返回新库 id 与端点范围说明。",
+      pitfalls: "create 是写操作会真的建库；受限端点上新库会自动加入本端点范围；get 依赖端点的状态与解析器目录权限，缺权限时会被拒绝并写明缺哪个许可。",
+    },
+    ingest_document: {
+      purpose: "把文件送进知识库并跟踪处理：submit 一次完成「上传 + 导入 + 解析入队」，status 回报上传 / 解析 / 索引各阶段。",
+      actions: [
+        ["submit", "提交文件：file 用 base64 携带字节（{name, encoding:\"base64\", content}），可带 process_config 指定解析引擎，idempotency_key 标识一次上传操作。"],
+        ["status", "按 ingest_id 或 document_id 查询阶段：phases.upload / parse / index，文档维度还带页数、分块数与错误信息。"],
+      ],
+      steps: [
+        "submit：用「换一个示例」选到 submit 示例（会自动生成一段小 Markdown 与新的 idempotency_key），运行后记下 ingest_id 与 document_id。",
+        "status：把示例切回 status（会自动带上刚提交的 ingest_id），反复运行直到 phases.parse=completed 且 phases.index=completed。",
+        "用 read_document.read + 上面的 document_id 核对正文，确认内容真的进去了。",
+      ],
+      expect: "submit 返回 stage=queued、非空 ingest_id / document_id；status 的 phases.parse 与 phases.index 最终变为 completed。",
+      pitfalls: "同内容重复提交会 deduplicated=true（复用旧解析结果，process_config 不再重新应用）；扫描件/大文件解析可能要几分钟；wiki、graph 在单文档维度固定为 not_reported（它们按库维度上报）。",
+    },
+    search_knowledge: {
+      purpose: "检索证据：文档分块、Wiki 页面、知识图谱三类来源；支持混合/语义/关键词检索，以及编号类精确串的字面匹配。",
+      actions: [
+        ["（单动作）", "一次调用可组合 sources 与 mode；match=literal 时文档来源改为字面匹配（要求端点开放 grep 许可）。"],
+      ],
+      steps: [
+        "先用「回读原文」的 list 动作找一篇 parse_status=completed 的文档，记住标题里的一个词。",
+        "sources=[document]、mode=hybrid：确认 results.document.results 非空并核对命中的内容。",
+        "换 match=literal 用编号 / 口令等精确串再检索一次，对比结果差异。",
+        "需要 Wiki 或图谱证据时把 sources 换成 [\"wiki\"] / [\"graph\"]（图谱必须显式给 knowledge_base_ids）。",
+      ],
+      expect: "results.<source>.results 非空；来源不可用时返回 partial=true 并给出 failed_sources 与具体原因。",
+      pitfalls: "库没开 Wiki / 图谱时该来源会失败并写明原因（不是工具坏了）；图谱库还需配置实体与关系类型；limit 上限 30。",
+    },
+    read_document: {
+      purpose: "浏览与回读原文：list 列出文档目录或 Wiki 目录，read 按文档 id 读正文（可只取相关段）或按 slug 读 Wiki 页。",
+      actions: [
+        ["list", "source_type=document：列出知识库的文档（含解析状态，用于挑一篇来读）；source_type=wiki：列出 Wiki 页面并给出 slug。"],
+        ["read", "source_type=document：按 knowledge_id 读正文，query 可只返回包含该词的片段；source_type=wiki：按 slug 读整页。"],
+      ],
+      steps: [
+        "list + knowledge_base_id：记下一篇 parse_status=completed 文档的 id 与标题。",
+        "read + knowledge_id（limit 3）：核对 document.chunks 内容；total_chunks / truncated 说明还有多少没读。",
+        "（Wiki）list + source_type=wiki 取一个 slug，再 read + source_type=wiki + slug + knowledge_base_id 读整页。",
+      ],
+      expect: "list 返回 documents.documents 与 total；read 返回 document.chunks 非空、且内容与原文一致。",
+      pitfalls: "列表动作 knowledge_base_id 必填；Wiki 的 read 需要 knowledge_base_id 与 slug 同时给出；文档未解析完成时正文可能为空。",
+    },
+    ask: {
+      purpose: "让 WeKnora 用自己的问答链回答：可选内置模式或端点发布的问答档案，返回回答、引用与 session_id。",
+      actions: [
+        ["（单动作）", "省略 mode 用端点默认档案；mode=quick-answer / smart-reasoning 钉住内置模式；带 session_id 续问同一会话。"],
+      ],
+      steps: [
+        "先不带 session_id 问一个问题（示例 1 用 quick-answer），记下返回的 session_id 与 references。",
+        "再问一个追问并把上面的 session_id 填进 session_id 字段：应返回同一个 session_id 且能沿用上文。",
+        "拿 references 里的 knowledge_id / chunk_id 去「回读原文」核对引用是否真实存在于原文。",
+      ],
+      expect: "answer 非空、references 有引用条目；续问返回同一个 session_id；换知识库范围或换模式后续问会被拒绝并提示新开会话。",
+      pitfalls: "会话绑定「端点 + 应答配置 + 有效知识库集合」，任一变化都会拒绝续问；smart-reasoning 需要工作区配置 Rerank 模型；省略 knowledge_base_ids 时按端点/档案配置解析范围。",
+    },
+  };
+
+  // FIELD_HELP 逐字段中文说明（含默认值与书写格式），比接口英文原文更适合自测阅读。
+  const FIELD_HELP = {
+    "knowledge_base.action": "必填：list=列库 / get=看详情 / create=新建。",
+    "knowledge_base.knowledge_base_id": "get 必填：要查看的知识库 id（从 list 结果里取）。",
+    "knowledge_base.include_capabilities": "get 可选，默认 true：是否附带解析器目录与已发布问答档案。",
+    "knowledge_base.name": "create 必填：新知识库名称，例如「演示库-诊断」。",
+    "knowledge_base.description": "create 可选：一句话描述。",
+    "knowledge_base.enable_wiki": "create 可选，默认 false：建库后是否生成 Wiki 页面。",
+    "knowledge_base.enable_graph": "create 可选，默认 false：是否开启图谱抽取（建议同时填实体/关系类型）。",
+    "knowledge_base.enable_keyword": "create 可选，默认 true：关键词索引。",
+    "knowledge_base.enable_vector": "create 可选，默认 true：语义（向量）索引。",
+    "knowledge_base.graph_entities": "create 选填：实体类型名，每行一个，例如 人员 / 项目 / 服务。",
+    "knowledge_base.graph_relations": "create 选填：关系，每行一条「起点,终点,类型」，例如 人员,项目,负责。",
+    "knowledge_base.embedding_model_id": "create 可选：覆盖工作区默认的向量模型 id（一般留空）。",
+    "knowledge_base.summary_model_id": "create 可选：覆盖工作区默认的问答模型 id（一般留空）。",
+
+    "ingest_document.action": "必填：submit=提交文件 / status=查阶段。",
+    "ingest_document.knowledge_base_id": "submit 必填：目标知识库 id。",
+    "ingest_document.file": "submit 必填，对象：{name:文件名, encoding:\"base64\", content:文件字节的 base64}。示例里已生成一段可用的 Markdown。",
+    "ingest_document.process_config": "submit 可选，对象：指定解析引擎，如 {\"parser_engine_rules\":[{\"file_types\":[\"pdf\"],\"engine\":\"builtin\"}]}；引擎名从 knowledge_base.get 的目录里选。",
+    "ingest_document.idempotency_key": "submit 建议填：一次上传操作的标识（UUID）；同标识配同一份字节可幂等重放，配不同字节会被拒绝。",
+    "ingest_document.ingest_id": "status 二选一：submit 返回的 ingest_id。",
+    "ingest_document.document_id": "status 二选一：文档 id（已知文档时可直接查）。",
+
+    "search_knowledge.query": "必填：检索词或问题，例如文档标题里的一个词。",
+    "search_knowledge.knowledge_base_ids": "可选：限定检索哪些库，每行一个 id；留空=范围内全部可见库。图谱来源必须显式给。",
+    "search_knowledge.sources": "可选，默认 [document]：document=文档分块 / wiki=Wiki 页面 / graph=知识图谱；可多选。",
+    "search_knowledge.mode": "可选，默认 hybrid：hybrid=向量+关键词 / semantic=语义 / keyword=关键词。",
+    "search_knowledge.match": "可选：literal=按字面匹配（核对编号、金额等），要求端点开放 grep 许可。",
+    "search_knowledge.limit": "可选，默认 10，最大 30：每个来源返回上限。",
+
+    "read_document.action": "必填：list=列目录 / read=读正文。",
+    "read_document.source_type": "可选，默认 document：document=文档 / wiki=Wiki 页面。",
+    "read_document.knowledge_base_id": "list 必填；读 Wiki 页时也必需。要浏览的知识库 id。",
+    "read_document.knowledge_id": "read（文档）必填：文档 id，从 list 结果里取。",
+    "read_document.slug": "read（Wiki）必填：页面标识，从 list + source_type=wiki 的结果里取。",
+    "read_document.query": "read 可选：只返回包含该词的片段，适合大文档抽查。",
+    "read_document.offset": "read 可选，默认 0：从第几个分块开始读。",
+    "read_document.limit": "read 可选：本次读取的分块数（默认 20，示例用 3 便于核对）。",
+    "read_document.page": "list 可选，默认 1：页码。",
+    "read_document.page_size": "list 可选：每页条数（示例 5）。",
+
+    "ask.question": "必填：要问的问题；诊断时建议问一个答案唯一、便于核对的小问题。",
+    "ask.knowledge_base_ids": "可选：本次问答可读的库，每行一个 id；留空=按端点/档案配置解析（默认档案可能自带库集合）。",
+    "ask.mode": "可选：quick-answer=固定检索链 / smart-reasoning=多步推理；留空=用端点发布的问答档案。",
+    "ask.profile_id": "可选：端点发布的问答档案 id（来自 knowledge_base.get 的 qa_profiles），不能填内部 agent id。",
+    "ask.session_id": "可选：上一次回答返回的 session_id，用于续问；要求端点、应答配置与有效知识库集合都没变。",
+  };
+  function fieldHelp(toolName, field) {
+    return FIELD_HELP[`${toolName}.${field}`] || FIELD_HELP[field] || "";
+  }
+
   function benchMount(section) {
     section.innerHTML = `
       <div class="card">
@@ -1112,15 +1238,29 @@ function materialsMount(section) {
     const box = section.querySelector("#b-detail");
     const t = B.tool;
     const [cn, desc] = toolCN(t.name);
+    const usage = TOOL_USAGE[t.name] || null;
+    const usageHtml = usage ? `
+      <div class="tool-usage">
+        <div class="kv"><b>用途</b>：${escapeHtml(usage.purpose)}</div>
+        <div class="kv"><b>动作</b>：</div>
+        <ul class="usage-list">${usage.actions.map(([a, d]) =>
+          `<li><span class="mono">${escapeHtml(a)}</span> — ${escapeHtml(d)}</li>`).join("")}</ul>
+        <div class="kv"><b>自测步骤</b>（按顺序，每步都用下面「填入示例」或手工填参）：</div>
+        <ol class="usage-list">${usage.steps.map(s => `<li>${escapeHtml(s)}</li>`).join("")}</ol>
+        <div class="kv"><b>判定标准</b>：${escapeHtml(usage.expect)}</div>
+        <div class="kv"><b>常见错误</b>：${escapeHtml(usage.pitfalls)}</div>
+      </div>` : "";
     box.innerHTML = `
       <h3>${escapeHtml(cn)} <span class="mono small muted">${escapeHtml(t.name)}</span>
         ${t.destructive ? '<span class="badge err">会改数据</span>' : '<span class="badge ok">只读</span>'}</h3>
       <div class="sub">${escapeHtml(desc || "（暂无中文说明）")}</div>
+      ${usageHtml}
       <details class="token-help"><summary>接口原始描述（MCP 契约，英文）</summary>
         <p>${escapeHtml(t.description || "（无描述）")}</p></details>
       <div class="row" style="align-items:center">
         <button id="b-example" class="btn ghost small">填入示例</button>
-        <span id="b-example-note" class="kv">示例会用当前知识库的真实 id 填好参数，直接点「运行」就能看到结果。</span>
+        <button id="b-example-next" class="btn ghost small">换一个示例</button>
+        <span id="b-example-note" class="kv">示例会用当前知识库的真实数据填好参数，直接点「运行」就能看到结果。</span>
       </div>
       <div class="row">
         <div class="seg" id="b-mode"><button data-m="form" class="on">表单</button><button data-m="json">JSON 编辑</button></div>
@@ -1132,8 +1272,9 @@ function materialsMount(section) {
       <div id="b-status" class="status-line" style="margin-top:10px"></div>
       <div id="b-result" class="result-pane" style="margin-top:10px"></div>`;
     B.formMode = "form";
+    B.exampleIdx = -1;
     B.formInputs = {};
-    buildForm(box.querySelector("#b-form"), t.inputSchema || {});
+    buildForm(box.querySelector("#b-form"), t.inputSchema || {}, t.name);
     box.querySelectorAll("#b-mode button").forEach(btn => {
       btn.onclick = () => {
         B.formMode = btn.dataset.m;
@@ -1142,14 +1283,15 @@ function materialsMount(section) {
         box.querySelector("#b-form").classList.toggle("hidden", !isForm);
         box.querySelector("#b-json").classList.toggle("hidden", isForm);
         if (!isForm) box.querySelector("#b-json-text").value = JSON.stringify(readForm(), null, 2);
-        else buildForm(box.querySelector("#b-form"), t.inputSchema || {});
+        else buildForm(box.querySelector("#b-form"), t.inputSchema || {}, t.name);
       };
     });
     box.querySelector("#b-example").onclick = () => fillToolExample(section, box);
+    box.querySelector("#b-example-next").onclick = () => fillToolExample(section, box, true);
     box.querySelector("#b-run").onclick = () => runBenchTool(section, box);
   }
 
-  function buildForm(container, schema) {
+  function buildForm(container, schema, toolName) {
     container.innerHTML = "";
     B.formInputs = {};
     const props = schema.properties || {};
@@ -1164,9 +1306,13 @@ function materialsMount(section) {
       const req = required.has(name) ? ' <span class="req">*</span>' : "";
       const cn = fieldCN(name);
       const enumHint = Array.isArray(spec.enum) ? `可选：${spec.enum.join(" / ")}` : "";
+      // 中文详细说明优先；接口英文原文降级为悬停提示，不占版面。
+      const help = fieldHelp(toolName, name) || spec.description || enumHint || "";
+      const typeLabel = spec.type === "array" ? "字符串数组" : (spec.type === "object" ? "对象" : (spec.type || "any"));
+      label.title = spec.description || "";
       label.innerHTML = `<span>${cn ? `${escapeHtml(cn)} ` : ""}<span class="mono muted">${escapeHtml(name)}</span>
-        <span class="muted">(${escapeHtml(spec.type || "any")})</span>${req}</span>
-        <span class="muted" style="font-size:11px">${escapeHtml(spec.description || enumHint || "")}</span>`;
+        <span class="muted">(${escapeHtml(typeLabel)})</span>${req}</span>
+        <span class="field-help">${escapeHtml(help)}</span>`;
       let el;
       if (Array.isArray(spec.enum)) {
         el = document.createElement("select"); el.className = "input wide";
@@ -1189,6 +1335,13 @@ function materialsMount(section) {
         el = document.createElement("input"); el.className = "input wide";
       }
       label.appendChild(el);
+      if (Array.isArray(spec.enum)) {
+        // 取值范围提示放在控件之后：控件始终是字段行的第一个子元素。
+        const hint = document.createElement("span");
+        hint.className = "field-enum";
+        hint.textContent = `取值范围：${spec.enum.join(" / ")}`;
+        label.appendChild(hint);
+      }
       container.appendChild(label);
       B.formInputs[name] = { el, spec };
     }
@@ -1219,17 +1372,8 @@ function materialsMount(section) {
 
   /* ---- 每个工具的「能真跑出结果」示例 ---- */
 
-  // TOOL_EXAMPLE_NOTE 说明点「填入示例」后跑出来的是什么，方便演示时讲。
-  const TOOL_EXAMPLE_NOTE = {
-    knowledge_base: "当前身份可见的知识库，以及每个库开启了哪些能力（list 动作）。",
-    ingest_document: "复用资料页最近一次提交的 ingest_id，查询上传/解析/索引各阶段。",
-    search_knowledge: "在目标知识库里做混合检索，返回命中的分块与来源文档。",
-    read_document: "读回目标知识库最近一篇文档的正文（取第 1 段）。",
-    ask: "一次原生问答，返回带引用的回答。",
-  };
-
   // EX 缓存示例用到的真实 id，避免每次点「填入示例」都重查一遍。
-  const EX = { kbId: "", docId: "", docTitle: "", docWord: "" };
+  const EX = { kbId: "", docId: "", docTitle: "", docWord: "", wikiKbId: "", wikiSlug: "" };
 
   function exampleKbId() {
     return S.uploadTargetKbId || (S.kbs[0] && S.kbs[0].id) || "";
@@ -1294,58 +1438,200 @@ function materialsMount(section) {
   }
 
 
-  // resolveToolExample 返回 { args, note }：参数全部来自当前真实状态。
-  async function resolveToolExample(name) {
-    const kbId = exampleKbId();
-    const kbList = { knowledge_base_ids: kbId ? [kbId] : [] };
-    switch (name) {
-      case "knowledge_base":
-        return { args: { action: "list" },
-                 note: "想看单个库的详情，把 action 改成 get 并填 knowledge_base_id" };
-      case "ingest_document": {
-        const ingestId = (M.receipt && M.receipt.ingest_id) || "";
-        const docId = (M.doc && M.doc.id) || "";
-        if (!ingestId && !docId) {
-          throw new Error("先在「资料解析」页提交一次，示例会复用那次 ingest_id / document_id");
-        }
-        const args = { action: "status" };
-        if (ingestId) args.ingest_id = ingestId;
-        else args.document_id = docId;
-        return { args, note: "查询最近一次导入的上传/解析/索引阶段" };
-      }
-      case "search_knowledge": {
-        await exampleNewestDoc(kbId);
-        return { args: Object.assign({ query: EX.docWord || "验收", sources: ["document"],
-                                       mode: "hybrid", limit: 5 }, kbList),
-                 note: "检索词「" + (EX.docWord || "验收") + "」取自最近文档的标题" };
-      }
-      case "read_document": {
-        await exampleNewestDoc(kbId);
-        if (!EX.docId) throw new Error("目标知识库里还没有文档，先上传一份");
-        return { args: { action: "read", knowledge_id: EX.docId, limit: 1 },
-                 note: "用的是《" + (EX.docTitle || EX.docId) + "》" };
-      }
-      case "ask":
-        return { args: { question: "这个知识库里有哪些资料？请按文档分别说明。", mode: "quick-answer" } };
-      default:
-        return { args: {} };
-    }
+  // demoSubmitFile 生成一段小 Markdown 作为 submit 示例的字节（UTF-8 安全的 base64）。
+  function demoSubmitFile() {
+    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
+    const text = `# 控制台诊断示例\n\n这是 ${stamp} 由「开发诊断」页通过 ingest_document.submit 导入的演示文档。\n`;
+    return { name: `diagnose-demo-${Date.now()}.md`, encoding: "base64",
+             content: btoa(unescape(encodeURIComponent(text))) };
   }
 
-  async function fillToolExample(section, box) {
+  // findFirstSlug 在 Wiki 目录结果里递归取第一个 slug（结构随页面类型变化）。
+  function findFirstSlug(node) {
+    if (node && typeof node === "object") {
+      if (typeof node.slug === "string" && node.slug) return node.slug;
+      for (const v of Object.values(node)) {
+        const found = findFirstSlug(v);
+        if (found) return found;
+      }
+    }
+    return "";
+  }
+
+  async function exampleWikiPage(kbId) {
+    if (EX.wikiKbId === kbId && EX.wikiSlug) return EX;
+    const r = await api("/api/tool", {
+      method: "POST",
+      json: { name: "read_document",
+              arguments: { action: "list", source_type: "wiki", knowledge_base_id: kbId } },
+      headers: materialsHeaders(), brief: "取示例 Wiki 页",
+    });
+    const block = ((r.data && r.data.result) || {}).wiki || {};
+    const slug = findFirstSlug(block);
+    EX.wikiKbId = kbId; EX.wikiSlug = slug;
+    if (!slug) {
+      throw new Error("该知识库的 Wiki 目录里没有页面（可能尚未生成 Wiki），换一个库或先生成");
+    }
+    return EX;
+  }
+
+  // TOOL_EXAMPLES：每个工具的可直接运行示例，按顺序循环；参数全部来自当前真实状态。
+  const TOOL_EXAMPLES = {
+    knowledge_base: [
+      { label: "list：列出可见知识库",
+        expect: "knowledge_bases 非空，每个库带能力标记",
+        build: async () => ({ args: { action: "list" } }) },
+      { label: "get：查看目标库详情（含解析器目录与问答档案）",
+        expect: "status.status.documents 有值、parser_engines.engines 非空",
+        build: async () => {
+          const kbId = exampleKbId();
+          if (!kbId) throw new Error("没有可见的知识库，先在「资料解析」页新建一个");
+          return { args: { action: "get", knowledge_base_id: kbId, include_capabilities: true },
+                   note: `用的是《${kbName(kbId)}》` };
+        } },
+      { label: "create：新建演示库（写操作，会真的建库）",
+        expect: "返回新库 id；随后用 list 能看到它",
+        build: async () => ({
+          args: { action: "create", name: "演示知识库-" + new Date().toISOString().slice(0, 10),
+                  description: "由「开发诊断」页创建", enable_wiki: false, enable_graph: false },
+          note: "创建成功后新库会自动加入本端点范围，可在「资料解析」页直接用它上传",
+        }) },
+    ],
+    ingest_document: [
+      { label: "submit：导入一段演示 Markdown（写操作）",
+        expect: "返回 stage=queued、非空 ingest_id 与 document_id",
+        build: async () => {
+          const kbId = exampleKbId();
+          if (!kbId) throw new Error("没有可见的知识库，先在「资料解析」页新建一个");
+          return { args: { action: "submit", knowledge_base_id: kbId, file: demoSubmitFile(),
+                           idempotency_key: uuid4() },
+                   note: "运行后记下返回的 ingest_id，再切到 status 示例轮询；同内容重复提交会 dedup" };
+        } },
+      { label: "status：查询最近一次导入的阶段",
+        expect: "phases.parse / index 最终变为 completed",
+        build: async () => {
+          const ingestId = (M.receipt && M.receipt.ingest_id) || "";
+          const docId = (M.doc && M.doc.id) || "";
+          if (!ingestId && !docId) throw new Error("还没有导入记录：先用 submit 示例提交一次，或在「资料解析」页导入");
+          const args = { action: "status" };
+          if (ingestId) args.ingest_id = ingestId; else args.document_id = docId;
+          return { args, note: ingestId ? "用的是资料页最近一次的 ingest_id" : "按最近一次的 document_id 查询" };
+        } },
+      { label: "status：按文档 id 查（已知文档时直接查）",
+        expect: "document.parse_status / index_status 有明确状态",
+        build: async () => {
+          const kbId = exampleKbId();
+          await exampleNewestDoc(kbId);
+          if (!EX.docId) throw new Error("目标知识库里还没有文档，先用 submit 示例导入一份");
+          return { args: { action: "status", document_id: EX.docId },
+                   note: `用的是《${EX.docTitle || EX.docId}》` };
+        } },
+    ],
+    search_knowledge: [
+      { label: "document：混合检索最近文档的标题词",
+        expect: "results.document.results 非空",
+        build: async () => {
+          const kbId = exampleKbId();
+          await exampleNewestDoc(kbId);
+          return { args: { query: EX.docWord || "验收", knowledge_base_ids: kbId ? [kbId] : [],
+                           sources: ["document"], mode: "hybrid", limit: 5 },
+                   note: `检索词「${EX.docWord || "验收"}」取自《${EX.docTitle || kbId}》的标题` };
+        } },
+      { label: "document + literal：按字面匹配核对精确串",
+        expect: "results.document.results 命中精确串",
+        build: async () => {
+          const kbId = exampleKbId();
+          await exampleNewestDoc(kbId);
+          return { args: { query: EX.docWord || "验收", knowledge_base_ids: kbId ? [kbId] : [],
+                           sources: ["document"], match: "literal", limit: 5 },
+                   note: "literal 需要在端点开放 grep 许可；核对编号、金额、口令这类精确串用它" };
+        } },
+      { label: "wiki：在 Wiki 页面里检索",
+        expect: "results.wiki 命中页面（或 failed_sources 写明原因）",
+        build: async () => {
+          const kb = capableKbs("wiki").find(k => k.id === exampleKbId()) || capableKbs("wiki")[0];
+          if (!kb) throw new Error("当前可见的知识库里没有开启 Wiki 的；可在「资料解析」页新建一个（勾选「同时生成 Wiki 页面」）");
+          return { args: { query: EX.docWord || "总结", knowledge_base_ids: [kb.id],
+                           sources: ["wiki"], limit: 5 },
+                   note: `用的是《${kb.name}》（已开启 Wiki）` };
+        } },
+      { label: "graph：在知识图谱里查关系",
+        expect: "results.graph.relations 非空（或写明图谱未配置）",
+        build: async () => {
+          const kb = capableKbs("graph").find(k => k.id === exampleKbId()) || capableKbs("graph")[0];
+          if (!kb) throw new Error("当前可见的知识库里没有开启图谱的；可在「资料解析」页新建一个（勾选「同时抽取知识图谱」并填实体/关系）");
+          return { args: { query: EX.docWord || "项目", knowledge_base_ids: [kb.id],
+                           sources: ["graph"] },
+                   note: `用的是《${kb.name}》（图谱需配置实体/关系类型；刚导入的资料要等抽取完成）` };
+        } },
+    ],
+    read_document: [
+      { label: "read：读回最近一篇文档的正文（前 3 段）",
+        expect: "document.chunks 非空、内容与原文一致",
+        build: async () => {
+          const kbId = exampleKbId();
+          await exampleNewestDoc(kbId);
+          if (!EX.docId) throw new Error("目标知识库里还没有文档，先上传一份");
+          return { args: { action: "read", knowledge_id: EX.docId, limit: 3 },
+                   note: `用的是《${EX.docTitle || EX.docId}》` };
+        } },
+      { label: "list：列出目标库最近的文档（含解析状态）",
+        expect: "documents.documents 与 total 有值",
+        build: async () => {
+          const kbId = exampleKbId();
+          if (!kbId) throw new Error("没有可见的知识库");
+          return { args: { action: "list", knowledge_base_id: kbId, page: 1, page_size: 5 },
+                   note: `列的是《${kbName(kbId)}》` };
+        } },
+      { label: "read(wiki)：读一个 Wiki 页面",
+        expect: "page 内容非空（或目录为空时给出原因）",
+        build: async () => {
+          const kb = capableKbs("wiki").find(k => k.id === exampleKbId()) || capableKbs("wiki")[0];
+          if (!kb) throw new Error("当前可见的知识库里没有开启 Wiki 的");
+          const ex = await exampleWikiPage(kb.id);
+          return { args: { action: "read", source_type: "wiki", slug: ex.wikiSlug,
+                           knowledge_base_id: kb.id },
+                   note: `读的是《${kb.name}》的 slug=${ex.wikiSlug}` };
+        } },
+    ],
+    ask: [
+      { label: "quick-answer：问一个答案唯一的小问题",
+        expect: "answer 非空、references 有引用；记下 session_id",
+        build: async () => ({ args: { question: "这份资料里的负责人是谁？", mode: "quick-answer" },
+                              note: "把返回的 session_id 记下来，用下一个示例续问" }) },
+      { label: "smart-reasoning：多步推理模式",
+        expect: "answer 非空（需要工作区配置 Rerank 模型，否则会明确报缺模型）",
+        build: async () => ({ args: { question: "把这份资料的关键结论按条目总结出来。",
+                                      mode: "smart-reasoning" } }) },
+      { label: "续问：带上上一次的 session_id",
+        expect: "返回同一个 session_id，回答能沿用上文",
+        build: async () => ({ args: { question: "上一个问题里提到的结论还有哪些细节？",
+                                      session_id: "" },
+                              note: "把上一次 ask 返回的 session_id 粘进 session_id 字段再运行；换了知识库范围或模式需要新开会话" }) },
+    ],
+  };
+
+  function kbName(kbId) {
+    return ((S.kbs || []).find(k => k.id === kbId) || {}).name || kbId;
+  }
+
+  async function fillToolExample(section, box, advance) {
     const note = box.querySelector("#b-example-note");
     const t = B.tool;
     if (!t) return;
     note.classList.remove("err");
+    const list = TOOL_EXAMPLES[t.name] || [{ label: "（无预设示例）", build: async () => ({ args: {} }) }];
+    const next = advance || B.exampleIdx >= 0 ? (B.exampleIdx + 1) % list.length : 0;
     note.textContent = "正在准备示例参数…";
     let resolved;
     try {
-      resolved = await resolveToolExample(t.name);
+      resolved = await list[next].build();
     } catch (e) {
       note.classList.add("err");
       note.textContent = e.message;
       return;
     }
+    B.exampleIdx = next;
     const args = resolved.args || {};
     if (B.formMode === "json") {
       box.querySelector("#b-json-text").value = JSON.stringify(args, null, 2);
@@ -1360,8 +1646,10 @@ function materialsMount(section) {
         else el.value = v == null ? "" : String(v);
       }
     }
-    note.textContent = (resolved.note ? resolved.note + " " : "") +
-      (TOOL_EXAMPLE_NOTE[t.name] || "示例参数已按当前真实数据填好");
+    const item = list[next];
+    note.textContent = `示例 ${next + 1}/${list.length}：${item.label}` +
+      (resolved.note ? `｜${resolved.note}` : "") +
+      (item.expect ? `｜预期：${item.expect}` : "");
   }
 
   async function runBenchTool(section, box) {
