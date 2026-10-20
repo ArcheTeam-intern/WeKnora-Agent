@@ -188,6 +188,8 @@ const PATH_CN = {
   "/api/ingest": "上传并导入（ingest_document.submit）",
   "/api/ingest_status": "查询导入状态",
   "/api/kb_status": "查询知识库状态",
+  "/api/documents": "文档目录（read_document.list）",
+  "/api/document": "文档正文（read_document.read）",
   "/api/tool": "调用 MCP 工具",
   "/api/checklist": "运行验证清单",
   "/api/ask": "知识问答（原生模式）",
@@ -630,6 +632,8 @@ async function openLoginDialog() {
         renderUserSelect();
         if (window.Views) Views.onIdentityChanged();
         await refreshAfterIdentity();
+        // 连接成功后清掉页面初始的「点击配置 Token」提示，避免它和成功提示叠在一起。
+        document.getElementById('toasts').innerHTML = '';
         closeModal(); toast('已连接 ' + value.email, 'ok');
       } catch (err) {
         // 回滚也是身份变化：再次推进 epoch，让失败尝试期间的响应同样作废。
@@ -645,7 +649,7 @@ async function openLoginDialog() {
 
 /* ---------------- 路由 ---------------- */
 function currentRoute() {
-  const m = (location.hash || "").match(/^#\/(materials|qa|bench)/);
+  const m = (location.hash || "").match(/^#\/(materials|docs|qa|bench)/);
   return m ? m[1] : "materials";
 }
 function applyRoute() {
@@ -653,12 +657,13 @@ function applyRoute() {
   S.ui.view = route;
   const headings = {
     materials: ['从一份资料开始', '上传、解析、核对原文，让每一次回答都有依据。'],
+    docs: ['看清每一份资料', '浏览知识库里的文档，核对状态，读回带序号的分块原文。'],
     qa: ['向知识提问', '连接你的资料，通过原文与引用找到可靠答案。'],
     bench: ['让每一次调用可见', '浏览可用能力，验证参数、结果与原文来源。'],
   };
   document.getElementById('page-title').textContent = headings[route][0];
   document.getElementById('page-description').textContent = headings[route][1];
-  for (const name of ["materials", "qa", "bench"]) {
+  for (const name of ["materials", "docs", "qa", "bench"]) {
     const sec = document.getElementById("view-" + name);
     sec.classList.toggle("hidden", name !== route);
     const nav = document.querySelector(`.nav-item[data-route="${name}"]`);

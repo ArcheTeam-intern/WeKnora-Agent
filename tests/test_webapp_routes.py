@@ -567,6 +567,87 @@ def test_ingest_status_forwards_both_ids(client, monkeypatch):
     assert seen == {"action": "status", "ingest_id": "i-1", "document_id": "doc-1"}
 
 
+# --- document management (read_document) ----------------------------------
+
+@pytest.mark.parametrize("path", ["/api/documents?knowledge_base_id=kb-1",
+                                  "/api/document?knowledge_id=doc-1"])
+def test_document_routes_require_identity(client, path):
+    assert client.get(path).status_code == 400
+
+
+def test_documents_forwards_paging_and_lifts_the_catalogue(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        assert name == "read_document"
+        seen.update(arguments)
+        return {"ok": True, "http_status": 200, "result": {
+            "source_type": "document", "knowledge_base_id": "kb-1",
+            "documents": {"total": 12, "page": 2, "page_size": 5,
+                          "documents": [{"id": "doc-1", "title": "样本",
+                                         "parse_status": "completed"}]}}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    body = client.get("/api/documents?knowledge_base_id=kb-1&page=2&page_size=5",
+                      headers=HEADERS).json()
+    assert seen == {"action": "list", "knowledge_base_id": "kb-1",
+                    "page": 2, "page_size": 5}
+    assert body == {"ok": True, "knowledge_base_id": "kb-1", "total": 12,
+                    "page": 2, "page_size": 5,
+                    "documents": [{"id": "doc-1", "title": "样本",
+                                   "parse_status": "completed"}]}
+
+
+def test_document_forwards_query_and_normalizes_the_reader(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        assert name == "read_document"
+        seen.update(arguments)
+        return {"ok": True, "http_status": 200, "result": {
+            "source_type": "document",
+            "document": {"knowledge_base_id": "kb-1",
+                         "document": {"knowledge_id": "doc-1", "title": "样本",
+                                      "parse_status": "completed", "chunk_count": 9},
+                         "chunks": [{"chunk_id": "c1", "chunk_index": 3,
+                                     "content": "负责人林澈"}],
+                         "total_chunks": 9, "fetched_chunks": 1,
+                         "offset": 0, "page_size": 8, "query": "林澈",
+                         "match_count": 1, "truncated": True, "next_offset": 4}}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    body = client.get("/api/document?knowledge_id=doc-1&offset=0&limit=8&query=林澈",
+                      headers=HEADERS).json()
+    assert seen == {"action": "read", "knowledge_id": "doc-1", "offset": 0,
+                    "limit": 8, "query": "林澈"}
+    assert body["document"]["title"] == "样本"
+    assert body["chunks"][0]["chunk_id"] == "c1"
+    assert body["match_count"] == 1
+    assert body["next_offset"] == 4 and body["truncated"] is True
+
+
+def test_document_reader_keeps_the_core_error_code(client, monkeypatch):
+    async def fake_call(name, arguments, headers, timeout=60):
+        return {"ok": False, "http_status": 404, "error": "document not found",
+                "error_code": "NOT_FOUND"}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.get("/api/document?knowledge_id=missing", headers=HEADERS)
+    # Business failures stay HTTP 200 (only auth is promoted to 401), with
+    # ok=false + the core code preserved so the page can explain them.
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False and body["error_code"] == "NOT_FOUND"
+
+
+def test_document_paging_values_are_bounded(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        seen.update(arguments)
+        return {"ok": True, "http_status": 200, "result": {"documents": {}}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    client.get("/api/documents?knowledge_base_id=kb-1&page=abc&page_size=500",
+               headers=HEADERS)
+    assert seen["page"] == 1 and seen["page_size"] == 100
+    client.get("/api/document?knowledge_id=doc-1&offset=-4&limit=0", headers=HEADERS)
+    assert seen["offset"] == 0 and seen["limit"] == 1
+
+
 def test_ask_forwards_the_native_mode(client, monkeypatch):
     seen = {}
     async def fake_call(name, arguments, headers, timeout=60):

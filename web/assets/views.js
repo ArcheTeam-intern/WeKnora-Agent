@@ -700,7 +700,431 @@ function materialsMount(section) {
     }
   }
 
-  /* ===================== 视图二：问答 ===================== */
+  /* ===================== 视图二：知识库文档管理 ===================== */
+  // 全部读写都走五工具核心：read_document.list 出目录，read_document.read
+  // 出正文（query 即文档内字面检索）。页面只做展示，不缓存跨身份的文档。
+  const D = {
+    mounted: false, kbId: "", loadedKb: "", docs: [], total: 0, page: 1, pageSize: 10,
+    selectedId: "", selected: null, doc: null, chunks: [], totalChunks: 0,
+    fetched: 0, offset: 0, limit: 8, query: "", matchCount: null,
+    truncated: false, nextOffset: null, loading: false, readLoading: false,
+    error: "", readError: "", reqSeq: 0, readSeq: 0,
+  };
+
+  function docPageCount() {
+    return Math.max(1, Math.ceil(D.total / D.pageSize));
+  }
+
+  function docStatusBadge(status) {
+    const key = String(status || "").toLowerCase();
+    const cls = ["completed", "success"].includes(key) ? "ok"
+      : ["failed", "cancelled"].includes(key) ? "err"
+      : key ? "warn" : "gray";
+    return `<span class="badge ${cls}">${escapeHtml(parseStatusCN(status))}</span>`;
+  }
+
+  function docsMount(section) {
+    section.innerHTML = `
+      <div class="card">
+        <h3>知识库文档 <span class="badge ok">MCP 只读</span></h3>
+        <div class="sub">浏览已入库文档、核对解析状态、读回分块原文。目录来自
+          <span class="mono">read_document.list</span>，正文与文档内检索来自
+          <span class="mono">read_document.read</span>；每次读取都由 WeKnora 按当前身份重新授权。</div>
+        <div class="row">
+          <label class="field grow"><span>知识库</span><select id="d-kb" class="input"></select></label>
+          <label class="field"><span>每页</span>
+            <select id="d-page-size" class="input">
+              <option value="10">10 篇</option>
+              <option value="20">20 篇</option>
+              <option value="50">50 篇</option>
+            </select></label>
+          <span class="grow"></span>
+          <button id="d-refresh" class="btn ghost small">刷新</button>
+        </div>
+        <div class="row"><span id="d-summary" class="kv">配置 Token 后加载文档。</span></div>
+      </div>
+      <div class="docs">
+        <div class="card">
+          <h3>文档目录</h3>
+          <input id="d-filter" class="input wide" placeholder="在当前页按标题 / 文件名过滤…">
+          <div id="d-list" class="doc-list" style="margin-top:10px"></div>
+          <div class="docs-pager">
+            <button id="d-prev" class="btn ghost small" disabled>上一页</button>
+            <span id="d-page" class="kv"></span>
+            <button id="d-next" class="btn ghost small" disabled>下一页</button>
+          </div>
+        </div>
+        <div class="card doc-reader-card">
+          <div id="d-reader"><div class="empty">从左侧选择一篇文档，这里会显示解析状态与分块原文。</div></div>
+        </div>
+      </div>`;
+
+    const size = section.querySelector("#d-page-size");
+    if (size) size.value = String(D.pageSize);
+    section.querySelector("#d-kb").onchange = e => {
+      D.kbId = e.target.value;
+      D.page = 1; D.selectedId = ""; D.selected = null; D.doc = null;
+      D.chunks = []; D.query = ""; D.error = ""; D.readError = "";
+      D.reqSeq++; D.readSeq++;
+      renderDocReader(section);
+      loadDocs(section);
+    };
+    section.querySelector("#d-page-size").onchange = e => {
+      D.pageSize = Number(e.target.value) || 10; D.page = 1;
+      loadDocs(section, { keepSelection: true });
+    };
+    section.querySelector("#d-refresh").onclick = () => {
+      D.error = "";
+      loadDocs(section, { keepSelection: true });
+    };
+    section.querySelector("#d-filter").oninput = () => renderDocRows(section);
+    section.querySelector("#d-prev").onclick = () => {
+      if (D.page <= 1) return;
+      D.page -= 1; loadDocs(section, { keepSelection: true });
+    };
+    section.querySelector("#d-next").onclick = () => {
+      if (D.page >= docPageCount()) return;
+      D.page += 1; loadDocs(section, { keepSelection: true });
+    };
+    D.mounted = true;
+    syncDocsKb(section);
+  }
+
+  // syncDocsKb 把顶栏已加载的知识库同步到本页下拉框；选中的库不可见时
+  // 回退到资料页目标库或第一个可见库，并只在库真正变化时重新拉目录。
+  function syncDocsKb(section) {
+    const sel = section.querySelector("#d-kb");
+    if (!sel) return;
+    const valid = new Set((S.kbs || []).map(k => k.id));
+    let next = D.kbId;
+    if (!next || !valid.has(next)) {
+      next = (S.uploadTargetKbId && valid.has(S.uploadTargetKbId))
+        ? S.uploadTargetKbId : ((S.kbs[0] && S.kbs[0].id) || "");
+    }
+    const changed = next !== D.kbId;
+    D.kbId = next;
+    sel.innerHTML = "";
+    if (!S.kbs.length) {
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = window.App.activeProfile() ? "没有可见的知识库" : "配置 Token 后加载";
+      sel.appendChild(o);
+    } else {
+      for (const kb of S.kbs) {
+        const o = document.createElement("option");
+        o.value = kb.id;
+        const typeCN = { document: "文档库", faq: "FAQ 库" }[kb.type] || kb.type;
+        o.textContent = typeCN ? `${kb.name} · ${typeCN}` : kb.name;
+        sel.appendChild(o);
+      }
+    }
+    sel.value = D.kbId;
+    if (changed) {
+      D.page = 1; D.selectedId = ""; D.selected = null; D.doc = null;
+      D.chunks = []; D.query = ""; D.error = ""; D.readError = "";
+      D.reqSeq++; D.readSeq++;
+      renderDocReader(section);
+    }
+    if (D.kbId && D.loadedKb !== D.kbId) loadDocs(section);
+    else if (!D.kbId) {
+      D.docs = []; D.total = 0; D.loadedKb = "";
+      renderDocRows(section); renderDocReader(section);
+    }
+  }
+
+  async function loadDocs(section, opts = {}) {
+    if (!D.kbId) { renderDocRows(section); return; }
+    const epoch = captureIdentityEpoch();
+    const seq = ++D.reqSeq;
+    D.loading = true;
+    D.error = "";
+    D.loadedKb = D.kbId;
+    updateDocSummary(section);
+    updateDocPager(section);
+    const box = section.querySelector("#d-list");
+    if (box) box.innerHTML = '<div class="kv">正在读取文档目录…</div>';
+    const qs = new URLSearchParams({ knowledge_base_id: D.kbId,
+      page: String(D.page), page_size: String(D.pageSize) });
+    const r = await api(`/api/documents?${qs}`, {
+      headers: materialsHeaders(), brief: "read_document.list",
+    });
+    if (!isCurrentIdentityEpoch(epoch) || r.stale || seq !== D.reqSeq) return;
+    D.loading = false;
+    const d = r.data || {};
+    if (!r.ok || !d.ok) {
+      D.docs = []; D.total = 0;
+      D.error = String(d.error || r.error || statusCN(r.status));
+      renderDocRows(section); renderDocReader(section);
+      return;
+    }
+    D.docs = Array.isArray(d.documents) ? d.documents : [];
+    D.total = Number(d.total) || 0;
+    D.page = Number(d.page) || D.page;
+    if (D.page > docPageCount()) { D.page = docPageCount(); return loadDocs(section, opts); }
+    D.selected = D.selectedId ? (D.docs.find(x => x.id === D.selectedId) || D.selected) : null;
+    if (D.selectedId && !D.docs.some(x => x.id === D.selectedId)) {
+      // 翻页后选中的文档不在本页：保留阅读器，目录里不再高亮即可。
+      D.selected = D.selected || { title: D.selectedId };
+    }
+    renderDocRows(section);
+    if (!D.selectedId) {
+      const first = D.docs.find(x => x.parse_status === "completed") || D.docs[0];
+      if (first) openDoc(section, first);
+      else renderDocReader(section);
+    } else {
+      renderDocReader(section);
+    }
+  }
+
+  function openDoc(section, doc) {
+    D.selectedId = doc.id;
+    D.selected = doc;
+    D.doc = null;
+    D.chunks = [];
+    D.totalChunks = 0;
+    D.fetched = 0;
+    D.offset = 0;
+    D.query = "";
+    D.matchCount = null;
+    D.truncated = false;
+    D.nextOffset = null;
+    D.readError = "";
+    renderDocRows(section);
+    renderDocReader(section, { loading: true });
+    loadDocument(section, { offset: 0, query: "" });
+  }
+
+  async function loadDocument(section, opts = {}) {
+    if (!D.selectedId) return;
+    const epoch = captureIdentityEpoch();
+    const seq = ++D.readSeq;
+    const offset = Math.max(0, Number(opts.offset) || 0);
+    const query = opts.query === undefined ? D.query : String(opts.query || "").trim();
+    D.offset = offset;
+    D.query = query;
+    D.readLoading = true;
+    D.readError = "";
+    renderDocReader(section, { loading: !D.doc });
+    const qs = new URLSearchParams({ knowledge_id: D.selectedId,
+      offset: String(offset), limit: String(D.limit) });
+    if (query) qs.set("query", query);
+    const r = await api(`/api/document?${qs}`, {
+      headers: materialsHeaders(),
+      brief: query ? "read_document.read（文档内检索）" : "read_document.read",
+    });
+    if (!isCurrentIdentityEpoch(epoch) || r.stale || seq !== D.readSeq) return;
+    D.readLoading = false;
+    const d = r.data || {};
+    if (!r.ok || !d.ok) {
+      D.readError = String(d.error || r.error || statusCN(r.status));
+      renderDocReader(section);
+      return;
+    }
+    D.doc = d.document || {};
+    D.chunks = Array.isArray(d.chunks) ? d.chunks : [];
+    D.totalChunks = Number(d.total_chunks) || 0;
+    D.fetched = Number(d.fetched_chunks) || D.chunks.length;
+    D.offset = Number(d.offset) || offset;
+    D.query = d.query || query;
+    D.matchCount = d.match_count;
+    D.truncated = !!d.truncated;
+    D.nextOffset = d.next_offset == null ? null : Number(d.next_offset);
+    renderDocReader(section);
+  }
+
+  function updateDocSummary(section) {
+    const el = section.querySelector("#d-summary");
+    if (!el) return;
+    if (!D.kbId) {
+      el.textContent = window.App.activeProfile() ? "没有可见的知识库。" : "配置 Token 后加载文档。";
+      return;
+    }
+    const name = ((S.kbs || []).find(k => k.id === D.kbId) || {}).name || D.kbId;
+    if (D.error) { el.textContent = `《${name}》读取失败：${D.error}`; return; }
+    el.textContent = `《${name}》共 ${D.total} 篇 · 第 ${D.page}/${docPageCount()} 页` +
+      (D.loading ? " · 加载中…" : "");
+  }
+
+  function updateDocPager(section) {
+    const label = section.querySelector("#d-page");
+    const prev = section.querySelector("#d-prev");
+    const next = section.querySelector("#d-next");
+    if (label) label.textContent = `第 ${D.page} / ${docPageCount()} 页`;
+    if (prev) prev.disabled = D.page <= 1 || D.loading;
+    if (next) next.disabled = D.page >= docPageCount() || D.loading;
+  }
+
+  function renderDocRows(section) {
+    const box = section.querySelector("#d-list");
+    if (!box) return;
+    box.innerHTML = "";
+    updateDocSummary(section);
+    updateDocPager(section);
+    if (!D.kbId) {
+      box.innerHTML = '<div class="empty">选择一个知识库后查看文档。</div>';
+      return;
+    }
+    if (D.error) {
+      box.innerHTML = `<div class="empty err-text">读取失败：${escapeHtml(D.error)}</div>`;
+      return;
+    }
+    if (!D.docs.length) {
+      box.innerHTML = '<div class="empty">这个知识库还没有文档。到「资料与解析」上传第一份资料。</div>';
+      return;
+    }
+    const filterEl = section.querySelector("#d-filter");
+    const filter = ((filterEl && filterEl.value) || "").trim().toLowerCase();
+    const rows = D.docs.filter(d => !filter ||
+      `${d.title || ""} ${d.file_name || ""}`.toLowerCase().includes(filter));
+    if (!rows.length) {
+      box.innerHTML = '<div class="empty">本页没有匹配的文档，试试翻页或清空过滤。</div>';
+      return;
+    }
+    // 用 DOM 节点建表：行点击直接绑定，也便于测试驱动真实 UI。
+    const table = document.createElement("table");
+    table.className = "tbl docs-tbl";
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const h of ["文档", "状态", "更新时间"]) {
+      const th = document.createElement("th");
+      th.textContent = h;
+      headRow.appendChild(th);
+    }
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    for (const d of rows) {
+      const tr = document.createElement("tr");
+      tr.className = "doc-row" + (d.id === D.selectedId ? " on" : "");
+      tr.dataset.docId = d.id;
+      const titleCell = document.createElement("td");
+      const title = escapeHtml(d.title || d.file_name || d.id);
+      const kind = [...new Set([d.file_type, d.source].filter(Boolean))]
+        .map(escapeHtml).join(" · ");
+      titleCell.innerHTML = `<div class="doc-title">${title}</div>` +
+        `<div class="doc-meta mono">${kind || escapeHtml(String(d.id).slice(0, 12))}</div>`;
+      const statusCell = document.createElement("td");
+      statusCell.innerHTML = docStatusBadge(d.parse_status);
+      const dateCell = document.createElement("td");
+      dateCell.className = "doc-date";
+      dateCell.textContent = String(d.updated_at || d.created_at || "")
+        .slice(0, 19).replace("T", " ");
+      tr.append(titleCell, statusCell, dateCell);
+      tr.onclick = () => openDoc(section, d);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    box.appendChild(table);
+  }
+
+  function docChunkHtml(c) {
+    const idx = c.chunk_index != null ? c.chunk_index : c.seq;
+    const roleText = { match: "命中", context_before: "上文", context_after: "下文", focus: "定位" }[c.role];
+    const role = roleText ? `<span class="doc-role ${escapeHtml(c.role)}">${roleText}</span>` : "";
+    const rawSnippet = String(c.match_snippet || "");
+    const snippet = rawSnippet
+      ? `<div class="dc-snippet">命中：${escapeHtml(rawSnippet.slice(0, 240))}${rawSnippet.length > 240 ? "…" : ""}</div>`
+      : "";
+    const faq = c.faq_question
+      ? `<div class="dc-faq">Q：${escapeHtml(c.faq_question)}</div>` : "";
+    const images = Array.isArray(c.images) && c.images.length
+      ? `<div class="kv">含 ${c.images.length} 张图片</div>` : "";
+    return `<article class="doc-chunk">
+      <div class="dc-head"><span class="dc-index">#${escapeHtml(String(idx))}</span>
+        <span class="mono">${escapeHtml(c.chunk_id || "")}</span>${role}</div>
+      ${snippet}${faq}<div class="dc-body">${renderMarkdown(c.content || "")}</div>${images}</article>`;
+  }
+
+  function renderDocReader(section, opts = {}) {
+    const box = section.querySelector("#d-reader");
+    if (!box) return;
+    if (!D.selectedId) {
+      box.innerHTML = '<div class="empty">从左侧选择一篇文档，这里会显示解析状态与分块原文。</div>';
+      return;
+    }
+    const info = D.doc || {};
+    const summary = D.selected || {};
+    const title = info.title || summary.title || summary.file_name || D.selectedId;
+    const status = info.parse_status || summary.parse_status || "";
+    const chunkCount = info.chunk_count != null ? info.chunk_count : D.totalChunks;
+    const metaBits = [info.file_type || summary.file_type, info.source || summary.source,
+      chunkCount ? `${chunkCount} 块` : null,
+      info.file_size, info.description].filter(Boolean);
+    const header = `
+      <div class="doc-reader-head">
+        <div><h3>${escapeHtml(title)}</h3>
+          <div class="kv mono">${escapeHtml(D.selectedId)}</div></div>
+        ${docStatusBadge(status)}
+      </div>
+      <div class="doc-meta-line">${metaBits.map(x =>
+        `<span>${escapeHtml(String(x))}</span>`).join("")}</div>`;
+    if (D.readError) {
+      box.innerHTML = header + `<div class="empty err-text">读取正文失败：${escapeHtml(D.readError)}</div>
+        <div class="row"><button id="d-read-retry" class="btn ghost small">重试</button></div>`;
+      box.querySelector("#d-read-retry").onclick = () => loadDocument(section, { offset: D.offset });
+      return;
+    }
+    if (opts.loading || (D.readLoading && !D.doc)) {
+      box.innerHTML = header + '<div class="kv">读取正文中…</div>';
+      return;
+    }
+    if (!D.doc) { box.innerHTML = header; return; }
+
+    const searching = !!D.query;
+    const chunksHtml = D.chunks.length
+      ? D.chunks.map(docChunkHtml).join("")
+      : (searching
+        ? `<div class="empty">没有找到包含「${escapeHtml(D.query)}」的分块，换一个词试试。</div>`
+        : (String(status).toLowerCase() === "completed"
+          ? '<div class="empty">这篇文档没有可读分块（可能只包含图片，或解析结果为空）。</div>'
+          : `<div class="empty">解析尚未完成（当前：${escapeHtml(parseStatusCN(status))}），暂时没有正文。到「资料与解析」页可继续看进度。</div>`));
+    const range = searching
+      ? (D.matchCount != null ? `命中 ${D.matchCount} 个分块` : `返回 ${D.chunks.length} 个分块`)
+      : `第 ${D.totalChunks ? D.offset + 1 : 0}–${D.offset + D.chunks.length} 块 / 共 ${D.totalChunks} 块`;
+    const canNext = D.truncated && D.nextOffset != null;
+    box.innerHTML = header + `
+      <div class="row doc-search">
+        <input id="d-query" class="input grow" placeholder="在本文档内检索（字面匹配；多个词需全部命中）">
+        <button id="d-query-run" class="btn ghost small">检索</button>
+        <button id="d-query-clear" class="btn ghost small"${searching ? "" : " disabled"}>清除</button>
+      </div>
+      ${D.readLoading ? '<div class="status-line cursor">正在读取这一段…</div>' : ""}
+      ${searching ? `<div class="kv">文档内检索「${escapeHtml(D.query)}」${D.truncated ? " · 结果已截断，可继续往后找" : ""}</div>` : ""}
+      <div class="doc-chunks">${chunksHtml}</div>
+      <div class="docs-pager">
+        <button id="d-read-prev" class="btn ghost small"${D.offset > 0 ? "" : " disabled"}>${searching ? "从头找" : "上一组"}</button>
+        <span class="kv">${range}</span>
+        <button id="d-read-next" class="btn ghost small"${canNext ? "" : " disabled"}>${searching ? "继续往后找" : "下一组"}</button>
+      </div>`;
+    const input = box.querySelector("#d-query");
+    if (input) {
+      input.value = D.query;
+      input.onkeydown = e => {
+        if (e.key === "Enter") { e.preventDefault(); runDocQuery(section); }
+      };
+    }
+    box.querySelector("#d-query-run").onclick = () => runDocQuery(section);
+    box.querySelector("#d-query-clear").onclick = () => loadDocument(section, { offset: 0, query: "" });
+    box.querySelector("#d-read-prev").onclick = () => {
+      if (searching) loadDocument(section, { offset: 0 });
+      else loadDocument(section, { offset: Math.max(0, D.offset - D.limit) });
+    };
+    box.querySelector("#d-read-next").onclick = () => {
+      if (D.nextOffset == null) return;
+      loadDocument(section, { offset: D.nextOffset });
+    };
+  }
+
+  function runDocQuery(section) {
+    // 读的是阅读器里实际渲染的输入框：同一 section 上再 querySelector 只会
+    // 拿到另一个占位节点（测试 DOM 尤其明显），真实页面也会读错控件。
+    const box = section.querySelector("#d-reader");
+    const input = box ? box.querySelector("#d-query") : null;
+    const q = input ? String(input.value || "").trim() : "";
+    loadDocument(section, { offset: 0, query: q });
+  }
+
+  /* ===================== 视图三：问答 ===================== */
 // Q.scopeAll/qbIds/mode 由 app.js 的状态渲染；问答只走 WeKnora 原生 ask。
   const Q = { sessionId: "", busy: false, mounted: false };
 
@@ -1145,6 +1569,22 @@ function materialsMount(section) {
     return FIELD_HELP[`${toolName}.${field}`] || FIELD_HELP[field] || "";
   }
 
+  // 核心工具的 inputSchema 没写 JSON Schema 的 default，但契约文本里明确
+  // 了默认值。三态下拉必须把真实默认显示出来，否则「不传」会被误解成
+  // 未指定；显式 true/false 仍然优先于这里的值。
+  const BOOL_DEFAULTS = {
+    "knowledge_base.enable_keyword": true,
+    "knowledge_base.enable_vector": true,
+    "knowledge_base.enable_graph": false,
+    "knowledge_base.enable_wiki": false,
+    "knowledge_base.include_capabilities": false,
+  };
+  function boolDefault(toolName, field, spec) {
+    if (typeof spec.default === "boolean") return spec.default;
+    const key = `${toolName}.${field}`;
+    return key in BOOL_DEFAULTS ? BOOL_DEFAULTS[key] : undefined;
+  }
+
   function benchMount(section) {
     section.innerHTML = `
       <div class="card">
@@ -1263,7 +1703,7 @@ function materialsMount(section) {
         <span id="b-example-note" class="kv">示例会用当前知识库的真实数据填好参数，直接点「运行」就能看到结果。</span>
       </div>
       <div class="row">
-        <div class="seg" id="b-mode"><button data-m="form" class="on">表单</button><button data-m="json">JSON 编辑</button></div>
+        <div class="seg" id="b-mode"></div>
         <span class="grow"></span>
         <button id="b-run" class="btn${t.destructive ? " danger" : ""}">运行</button>
       </div>
@@ -1274,17 +1714,45 @@ function materialsMount(section) {
     B.formMode = "form";
     B.exampleIdx = -1;
     B.formInputs = {};
+    B.extraArgs = {};
     buildForm(box.querySelector("#b-form"), t.inputSchema || {}, t.name);
-    box.querySelectorAll("#b-mode button").forEach(btn => {
+    const modeWrap = box.querySelector("#b-mode");
+    const modeButtons = [["form", "表单"], ["json", "JSON 编辑"]].map(([mode, label]) => {
+      const btn = document.createElement("button");
+      btn.dataset.m = mode;
+      btn.textContent = label;
+      btn.classList.toggle("on", mode === "form");
       btn.onclick = () => {
-        B.formMode = btn.dataset.m;
-        box.querySelectorAll("#b-mode button").forEach(b => b.classList.toggle("on", b === btn));
-        const isForm = B.formMode === "form";
+        const want = mode;
+        const jsonBox = box.querySelector("#b-json-text");
+        let args;
+        try {
+          if (want === "json") {
+            args = readForm();
+            jsonBox.value = JSON.stringify(args, null, 2);
+          } else {
+            args = JSON.parse(jsonBox.value || "{}");
+            if (!args || typeof args !== "object" || Array.isArray(args)) {
+              throw new Error("顶层必须是对象");
+            }
+          }
+        } catch (e) {
+          toast((want === "json" ? "表单转 JSON 失败：" : "JSON 解析失败：") + e.message, "err");
+          return;  // 切换失败时保持当前模式与已填内容，不重置表单
+        }
+        B.formMode = want;
+        modeButtons.forEach(b => b.classList.toggle("on", b === btn));
+        const isForm = want === "form";
         box.querySelector("#b-form").classList.toggle("hidden", !isForm);
         box.querySelector("#b-json").classList.toggle("hidden", isForm);
-        if (!isForm) box.querySelector("#b-json-text").value = JSON.stringify(readForm(), null, 2);
-        else buildForm(box.querySelector("#b-form"), t.inputSchema || {}, t.name);
+        if (isForm) {
+          // 回填 JSON 里的值：切回表单不应清空用户已填的内容。
+          buildForm(box.querySelector("#b-form"), t.inputSchema || {}, t.name);
+          applyArgsToForm(args);
+        }
       };
+      modeWrap.appendChild(btn);
+      return btn;
     });
     box.querySelector("#b-example").onclick = () => fillToolExample(section, box);
     box.querySelector("#b-example-next").onclick = () => fillToolExample(section, box, true);
@@ -1320,7 +1788,17 @@ function materialsMount(section) {
           const o = document.createElement("option"); o.value = String(v); o.textContent = String(v); el.appendChild(o);
         }
       } else if (spec.type === "boolean") {
-        el = document.createElement("input"); el.type = "checkbox";
+        // 布尔字段是三态：不传（用服务端默认）、显式 true、显式 false。
+        // 单纯复选框无法表达「默认 true 但我要关掉」，所以用下拉。
+        el = document.createElement("select"); el.className = "input wide";
+        const fallback = boolDefault(toolName, name, spec);
+        const def = fallback === true ? "true" : (fallback === false ? "false" : "未指定");
+        for (const [value, text] of [["", `不传（使用默认：${def}）`],
+                                     ["true", "true（开启）"],
+                                     ["false", "false（关闭）"]]) {
+          const o = document.createElement("option");
+          o.value = value; o.textContent = text; el.appendChild(o);
+        }
       } else if (spec.type === "number" || spec.type === "integer") {
         el = document.createElement("input"); el.type = "number"; el.className = "input wide";
       } else if (spec.type === "array") {
@@ -1348,10 +1826,13 @@ function materialsMount(section) {
   }
 
   function readForm() {
-    const args = {};
+    // 从 JSON 切回表单时，schema 之外的键留在 extraArgs，再次运行/切回 JSON
+    // 都原样带回，不会因为表单没有对应控件而悄悄丢参数。
+    const args = Object.assign({}, B.extraArgs || {});
     for (const [name, { el, spec }] of Object.entries(B.formInputs)) {
       if (spec.type === "boolean") {
-        if (el.checked) args[name] = true;
+        if (el.value === "true") args[name] = true;
+        else if (el.value === "false") args[name] = false;
         continue;
       }
       const raw = (el.value || "").trim();
@@ -1368,6 +1849,33 @@ function materialsMount(section) {
       }
     }
     return args;
+  }
+
+  // applyArgsToForm 把一份参数对象回填到当前表单；JSON 切回表单、填入示例
+  // 都走这里，保证两条路径的显示完全一致。schema 外的键进 extraArgs。
+  function applyArgsToForm(args) {
+    B.extraArgs = {};
+    const known = new Set(Object.keys(B.formInputs));
+    for (const [name, { el, spec }] of Object.entries(B.formInputs)) {
+      if (!(name in args)) { el.value = ""; continue; }
+      const v = args[name];
+      if (spec.type === "boolean") {
+        el.value = v ? "true" : "false";
+        continue;
+      }
+      if (Array.isArray(spec.enum) && !spec.enum.map(String).includes(String(v))) {
+        // 下拉里没有这个值：保留在 extraArgs，不让表单静默改成别的选项。
+        B.extraArgs[name] = v;
+        el.value = "";
+        continue;
+      }
+      if (spec.type === "array") el.value = Array.isArray(v) ? v.join("\n") : String(v);
+      else if (spec.type === "object") el.value = JSON.stringify(v, null, 2);
+      else el.value = v == null ? "" : String(v);
+    }
+    for (const [name, v] of Object.entries(args)) {
+      if (!known.has(name)) B.extraArgs[name] = v;
+    }
   }
 
   /* ---- 每个工具的「能真跑出结果」示例 ---- */
@@ -1636,15 +2144,7 @@ function materialsMount(section) {
     if (B.formMode === "json") {
       box.querySelector("#b-json-text").value = JSON.stringify(args, null, 2);
     } else {
-      for (const [name, entry] of Object.entries(B.formInputs)) {
-        const el = entry.el, spec = entry.spec;
-        if (!(name in args)) { el.checked = false; el.value = ""; continue; }
-        const v = args[name];
-        if (spec.type === "boolean") el.checked = !!v;
-        else if (spec.type === "array") el.value = Array.isArray(v) ? v.join("\n") : String(v);
-        else if (spec.type === "object") el.value = JSON.stringify(v, null, 2);
-        else el.value = v == null ? "" : String(v);
-      }
+      applyArgsToForm(args);
     }
     const item = list[next];
     note.textContent = `示例 ${next + 1}/${list.length}：${item.label}` +
@@ -1708,15 +2208,23 @@ function materialsMount(section) {
       docPollSeq++;  // 旧身份的轮询循环立即失效
       Object.assign(Q, { sessionId: "", busy: false, mounted: false });
       Object.assign(B, { tool: null, mounted: false });
-      for (const name of ["materials", "qa", "bench"]) document.getElementById("view-" + name).innerHTML = "";
+      Object.assign(D, { mounted: false, kbId: "", loadedKb: "", docs: [], total: 0,
+                             page: 1, selectedId: "", selected: null, doc: null, chunks: [],
+                             query: "", error: "", readError: "", loading: false,
+                             readLoading: false, reqSeq: D.reqSeq + 1, readSeq: D.readSeq + 1 });
+      for (const name of ["materials", "docs", "qa", "bench"]) {
+        document.getElementById("view-" + name).innerHTML = "";
+      }
       this.show(S.ui.view, document.getElementById("view-" + S.ui.view));
     },
     show(name, section) {
       if (name === "materials" && !M.mounted) materialsMount(section);
+      if (name === "docs" && !D.mounted) docsMount(section);
       if (name === "qa" && !Q.mounted) qaMount(section);
       if (name === "bench" && !B.mounted) benchMount(section);
       if (name === "bench" && B.mounted) renderToolList(section, "");
       if (name === "materials") { syncKbSelect(section); syncEngineSelect(section); }
+      if (name === "docs" && D.mounted) syncDocsKb(section);
       if (name === "qa") { qaScopeChips(section); renderQaScopeLine(section); updateQaSendState(section); }
     },
     onSelectionChanged() {
@@ -1725,6 +2233,7 @@ function materialsMount(section) {
         syncKbSelect(materials);
         syncEngineSelect(materials);
       }
+      if (D.mounted) syncDocsKb(document.getElementById("view-docs"));
       if (Q.mounted) {
         const qa = document.getElementById("view-qa");
         qaScopeChips(qa);

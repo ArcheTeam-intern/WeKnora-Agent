@@ -1048,6 +1048,99 @@ async def kb_status(request: Request):
     return JSONResponse({"ok": True, "result": r.get("result")})
 
 
+def _int_query(request: Request, name: str, default: int,
+               minimum: int = 1, maximum: int = 100) -> int:
+    """Read a bounded integer query parameter without rejecting the request.
+
+    MCP clamps the same fields again, so a malformed value may safely fall
+    back to the page's default instead of turning into a 500 here.
+    """
+    raw = (request.query_params.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+async def documents(request: Request):
+    """read_document.list: one library's document catalogue.
+
+    The core tool wraps its result as `documents: {total, page, ...}`; the
+    console lifts those fields to the top level so the page can render a
+    pager without knowing the core envelope.
+    """
+    user_headers = _extract_mcp_headers(request)
+    if user_headers is None:
+        return _missing_header_response()
+    kb_id = (request.query_params.get("knowledge_base_id") or "").strip()
+    if not kb_id:
+        return JSONResponse({"error": "knowledge_base_id is required"}, status_code=400)
+    page = _int_query(request, "page", 1)
+    page_size = _int_query(request, "page_size", 10)
+    r = await _call_tool("read_document", {
+        "action": "list", "knowledge_base_id": kb_id,
+        "page": page, "page_size": page_size,
+    }, user_headers)
+    if not r["ok"]:
+        return JSONResponse({"ok": False, "error": r.get("error"),
+                             "error_code": r.get("error_code"), "result": r.get("result")},
+                            status_code=_response_status(r))
+    block = (r.get("result") or {}).get("documents") or {}
+    return JSONResponse({
+        "ok": True,
+        "knowledge_base_id": block.get("knowledge_base_id") or kb_id,
+        "total": block.get("total") or 0,
+        "page": block.get("page") or page,
+        "page_size": block.get("page_size") or page_size,
+        "documents": block.get("documents") or [],
+    })
+
+
+async def document(request: Request):
+    """read_document.read: one document's metadata and a page of chunks.
+
+    `query` switches the core tool to in-document literal search, which
+    returns matched chunks with one chunk of context on each side; `offset`
+    continues from the returned `next_offset`.
+    """
+    user_headers = _extract_mcp_headers(request)
+    if user_headers is None:
+        return _missing_header_response()
+    doc_id = (request.query_params.get("knowledge_id") or "").strip()
+    if not doc_id:
+        return JSONResponse({"error": "knowledge_id is required"}, status_code=400)
+    offset = _int_query(request, "offset", 0, minimum=0, maximum=1_000_000)
+    limit = _int_query(request, "limit", 10)
+    arguments = {"action": "read", "knowledge_id": doc_id,
+                 "offset": offset, "limit": limit}
+    query = (request.query_params.get("query") or "").strip()
+    if query:
+        arguments["query"] = query
+    r = await _call_tool("read_document", arguments, user_headers)
+    if not r["ok"]:
+        return JSONResponse({"ok": False, "error": r.get("error"),
+                             "error_code": r.get("error_code"), "result": r.get("result")},
+                            status_code=_response_status(r))
+    data = (r.get("result") or {}).get("document") or {}
+    return JSONResponse({
+        "ok": True,
+        "knowledge_base_id": data.get("knowledge_base_id") or "",
+        "document": data.get("document") or {},
+        "chunks": data.get("chunks") or [],
+        "total_chunks": data.get("total_chunks") or 0,
+        "fetched_chunks": data.get("fetched_chunks") or 0,
+        "offset": data.get("offset", offset),
+        "page_size": data.get("page_size", limit),
+        "query": data.get("query") or "",
+        "match_count": data.get("match_count"),
+        "truncated": bool(data.get("truncated")),
+        "next_offset": data.get("next_offset"),
+    })
+
+
 async def parser_engines(request: Request):
     """Parser catalogue through knowledge_base.get(include_capabilities).
 
@@ -1297,6 +1390,8 @@ def build_app() -> Starlette:
         Route("/api/ingest", ingest, methods=["POST"]),
         Route("/api/ingest_status", ingest_status),
         Route("/api/kb_status", kb_status),
+        Route("/api/documents", documents),
+        Route("/api/document", document),
         Route("/healthz", healthz),
         Mount("/assets", app=StaticFiles(directory=str(assets)), name="assets"),
     ])

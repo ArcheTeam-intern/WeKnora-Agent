@@ -45,11 +45,12 @@ powershell -ExecutionPolicy Bypass -File scripts\refresh-credential.ps1   # 一�
 
 连接工作台只需两步：页面右上角「配置 Token」→ 点「🔄 读取本机凭证」→「连接工作台」。（也可以粘贴 JWT 或导入凭证 JSON；凭据在通过 MCP 校验前不会生效，只保存在当前标签页。）
 
-控制台有三个视图，全部操作经 MCP 完成，右上角「MCP 调用轨迹」抽屉保留每次请求的原始 JSON：
+控制台有四个视图，全部操作经 MCP 完成，右上角「MCP 调用轨迹」抽屉保留每次请求的原始 JSON：
 
 - **资料解析**：可直接「＋ 新建知识库」（经 MCP `knowledge_base` 的 `create` 动作，建完自动刷新并选中；受限端点会把新库加入自己的范围）；**上传目标知识库**与**解析引擎**各自独立选择（引擎来自 `knowledge_base.get` 返回的真实目录，不可用的引擎带原因且不可选；「使用知识库默认」即不指定）。「上传并导入」是一次 `ingest_document.submit`：文件字节 base64 随请求发送，`process_config` 同次提交解析规则；随后轮询 `ingest_document.status` 显示上传/解析/索引各阶段与「请求引擎/实际引擎」，解析完成后用 `read_document.read` 回读分块数与原文预览。
+- **知识库文档**：面向日常使用的文档管理页——选择知识库后自动加载文档目录（`read_document.list` 分页，显示标题、类型、解析状态和更新时间），点任一行在右侧读回分块原文（`read_document.read`，附分块序号与 `chunk_id`）；支持上一组/下一组翻页，以及在单篇文档内做字面检索（命中块带「命中/上文/下文」标记，结果截断时可「继续往后找」）。切换知识库、翻页或换身份都会作废旧请求，页面不会串数据。
 - **知识问答**：**问答范围**多选知识库（或「全部可用」；未选择时发送按钮禁用）与上传目标互不干扰；**问答模式**用五工具核心的 `ask` 的 `quick-answer` / `smart-reasoning`（模式经 MCP 参数提交，由服务端校验并回显）。切换范围或模式会开启新会话并丢弃旧范围/旧模式在途的回答；同一会话内可带 `session_id` 续问。控制台本身不含任何第三方编排框架——它验证的是主产品将来直接消费的 MCP 表面。
-- **开发诊断**：`tools/list` 展示的就是 core 面的五个工具（按 inputSchema 自动生成参数表单，可切 JSON 编辑）、原始请求/响应面板、`ingest_document` 写操作二次确认；每个工具都带中文「用途 / 动作 / 自测步骤 / 判定标准 / 常见错误」说明，参数逐字段给出中文详解（含默认值与书写格式）；「填入示例 / 换一个示例」按顺序循环多个可直接运行的示例——列库、看库详情、提交演示文档、轮询阶段、混合/字面/Wiki/图谱检索、读正文与 Wiki 页、三种问答模式续问，参数全部取自当前真实状态并附预期结果；验证清单按五工具动作序列运行（`knowledge_base.list/get` → `ingest_document.status` → `read_document.read/list` → `search_knowledge` 文档/字面/Wiki/图谱），按 `capability_flags` 与运行时可用性两级门控跳过并注明原因，可下载 JSON。
+- **开发诊断**：`tools/list` 展示的就是 core 面的五个工具（按 inputSchema 自动生成参数表单，可切 JSON 编辑）、原始请求/响应面板、`ingest_document` 写操作二次确认；每个工具都带中文「用途 / 动作 / 自测步骤 / 判定标准 / 常见错误」说明，参数逐字段给出中文详解（含默认值与书写格式）；布尔参数是三态下拉（不传=服务端默认 / true / false），默认 `true` 的字段也能显式关掉；表单与 JSON 互切会保留已填内容，schema 外的键在往返中不丢失；「填入示例 / 换一个示例」按顺序循环多个可直接运行的示例——列库、看库详情、提交演示文档、轮询阶段、混合/字面/Wiki/图谱检索、读正文与 Wiki 页、三种问答模式续问，参数全部取自当前真实状态并附预期结果；验证清单按五工具动作序列运行（`knowledge_base.list/get` → `ingest_document.status` → `read_document.read/list` → `search_knowledge` 文档/字面/Wiki/图谱），按 `capability_flags` 与运行时可用性两级门控跳过并注明原因，可下载 JSON。
 
 凭证由 WeKnora 验证目录里的独立工具 `issue_user_token.py` 正式签发（access token 24 小时过期）；`scripts/refresh-credential.ps1` 只是它的本机便捷入口，签发后会把新 JWT 同步进 `.env` 供 CLI 使用，并把凭证文件留在标准位置供工作台一键读取（`GET /api/local-credential` 只在显式设置 `WEKNORA_CREDENTIAL_FILE` 且请求来自本机时读取）。工作台自身不做登录、不保存密码、不自动续期；知识库范围是可选的收窄（与 MCP 契约一致：不选=不收窄），顶栏显示当前身份、端点名称/模式/工具数与范围摘要（只读）。
 

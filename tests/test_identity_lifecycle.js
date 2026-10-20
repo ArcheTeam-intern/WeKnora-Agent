@@ -597,3 +597,168 @@ test("sending is disabled until a QA knowledge-base scope is chosen", async () =
   w.Views.show("qa", section);
   assert.equal(send.disabled, false, "选择全部可用后应可提问");
 });
+
+/* ---------------- 11. 布尔字段：三态且能显式关闭默认 true ---------------- */
+test("boolean fields are tri-state and can explicitly override a true default", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-bench");
+  w.App.S.ui.view = "bench";
+  setIdentity(w, "a@example.com", "token-a");
+  w.App.S.tools = [{
+    name: "knowledge_base", description: "d", destructive: false,
+    inputSchema: { type: "object", properties: {
+      action: { type: "string", enum: ["create"] },
+      name: { type: "string" },
+      enable_keyword: { type: "boolean", description: "关键词索引" },
+    } },
+  }];
+  w.Views.show("bench", section);
+  const item = section.querySelector("#b-list").children.find(c => String(c.className).includes("tool-item"));
+  item.onclick();
+  await flush();
+
+  const detail = section.querySelector("#b-detail");
+  const form = detail.querySelector("#b-form");
+  const labels = form.children.filter(c => String(c.tagName) === "label");
+  const boolLabel = labels.find(l => String(l.innerHTML).includes("enable_keyword"));
+  const select = boolLabel.children[0];
+  assert.equal(select.tagName, "select", "布尔字段应是下拉而不是复选框");
+  assert.equal(select.children.length, 3, "应提供 不传 / true / false 三种选择");
+  assert.equal(select.children[0].value, "", "第一项是不传");
+  assert.match(select.children[0].textContent, /默认：true/);
+
+  labels.find(l => String(l.innerHTML).includes(">name<")).children[0].value = "测试库";
+  labels.find(l => String(l.innerHTML).includes(">action<")).children[0].value = "create";
+  select.value = "false";
+  detail.querySelector("#b-run").onclick();
+  await flush();
+  const call = takeCall("/api/tool");
+  const args = JSON.parse(call.opts.body).arguments;
+  assert.equal(args.enable_keyword, false, "勾选 false 必须显式发送 false，而不是省略");
+  call.resolve(jsonResp(200, { ok: true, result: {} }));
+  await flush();
+
+  select.value = "";
+  detail.querySelector("#b-run").onclick();
+  await flush();
+  const call2 = takeCall("/api/tool");
+  assert.equal("enable_keyword" in JSON.parse(call2.opts.body).arguments, false,
+               "选择不传时应省略字段，让服务端使用默认值");
+  call2.resolve(jsonResp(200, { ok: true, result: {} }));
+  await flush();
+});
+
+/* ---------------- 12. 表单 ↔ JSON 往返保留已填内容 ---------------- */
+test("switching between the form and JSON keeps both directions' values", async () => {
+  const w = boot();
+  const section = w.document.getElementById("view-bench");
+  w.App.S.ui.view = "bench";
+  setIdentity(w, "a@example.com", "token-a");
+  w.App.S.tools = [{
+    name: "knowledge_base", description: "d", destructive: false,
+    inputSchema: { type: "object", properties: {
+      action: { type: "string", enum: ["create"] },
+      name: { type: "string" },
+      enable_keyword: { type: "boolean", default: true },
+    } },
+  }];
+  w.Views.show("bench", section);
+  const item = section.querySelector("#b-list").children.find(c => String(c.className).includes("tool-item"));
+  item.onclick();
+  await flush();
+
+  const detail = section.querySelector("#b-detail");
+  const form = detail.querySelector("#b-form");
+  const labels = () => form.children.filter(c => String(c.tagName) === "label");
+  const boolSelect = () => labels().find(l => String(l.innerHTML).includes("enable_keyword")).children[0];
+  labels().find(l => String(l.innerHTML).includes(">name<")).children[0].value = "往返测试库";
+  labels().find(l => String(l.innerHTML).includes(">action<")).children[0].value = "create";
+  boolSelect().value = "false";
+
+  const modes = detail.querySelector("#b-mode").children;
+  assert.equal(modes.length, 2, "应有表单 / JSON 两个模式按钮");
+  modes[1].onclick();  // 表单 -> JSON
+  const jsonBox = detail.querySelector("#b-json-text");
+  const fromForm = JSON.parse(jsonBox.value);
+  assert.equal(fromForm.name, "往返测试库");
+  assert.equal(fromForm.enable_keyword, false);
+
+  // 在 JSON 里加一个 schema 之外的键，切回表单后再运行，它也必须保留。
+  fromForm.custom_flag = 7;
+  jsonBox.value = JSON.stringify(fromForm);
+  modes[0].onclick();  // JSON -> 表单
+  const fresh = labels().slice(-3);
+  assert.equal(fresh.find(l => String(l.innerHTML).includes(">name<")).children[0].value,
+               "往返测试库", "切回表单不应清空字符串字段");
+  assert.equal(fresh.find(l => String(l.innerHTML).includes("enable_keyword")).children[0].value,
+               "false", "切回表单应恢复布尔三态");
+
+  detail.querySelector("#b-run").onclick();
+  await flush();
+  const call = takeCall("/api/tool");
+  const args = JSON.parse(call.opts.body).arguments;
+  assert.equal(args.name, "往返测试库");
+  assert.equal(args.enable_keyword, false);
+  assert.equal(args.custom_flag, 7, "schema 外的键不得在表单往返中丢失");
+  call.resolve(jsonResp(200, { ok: true, result: {} }));
+  await flush();
+});
+
+/* ---------------- 13. 文档管理：目录 + 正文 + 文档内检索 ---------------- */
+test("the document page lists a library and reads chunks through MCP", async () => {
+  const w = boot();
+  setIdentity(w, "a@example.com", "token-a");
+  w.App.S.kbs = [{ id: "kb-1", name: "验收库", type: "document" }];
+  w.App.S.uploadTargetKbId = "kb-1";
+  const section = w.document.getElementById("view-docs");
+  w.App.S.ui.view = "docs";
+  w.Views.show("docs", section);
+  await flush();
+
+  const listCall = takeCall("/api/documents");
+  assert.match(listCall.path, /knowledge_base_id=kb-1/);
+  assert.match(listCall.path, /page=1/);
+  assert.match(listCall.path, /page_size=10/);
+  listCall.resolve(jsonResp(200, { ok: true, knowledge_base_id: "kb-1", total: 2,
+    page: 1, page_size: 10, documents: [
+      { id: "doc-1", title: "青岚计划.pdf", parse_status: "completed", file_type: "pdf" },
+      { id: "doc-2", title: "旧文档.md", parse_status: "failed", file_type: "md" },
+    ] }));
+  await flush();
+
+  const readCall = takeCall("/api/document");
+  assert.match(readCall.path, /knowledge_id=doc-1/);
+  assert.match(readCall.path, /offset=0/);
+  readCall.resolve(jsonResp(200, { ok: true, knowledge_base_id: "kb-1",
+    document: { knowledge_id: "doc-1", title: "青岚计划.pdf", parse_status: "completed",
+                chunk_count: 3, file_type: "pdf" },
+    chunks: [{ chunk_id: "c-1", chunk_index: 0, content: "负责人林澈。" }],
+    total_chunks: 3, fetched_chunks: 1, offset: 0, page_size: 8,
+    query: "", match_count: null, truncated: true, next_offset: 1 }));
+  await flush();
+
+  const reader = section.querySelector("#d-reader");
+  assert.match(reader.innerHTML, /青岚计划\.pdf/);
+  assert.match(reader.innerHTML, /负责人林澈/);
+  assert.match(reader.innerHTML, /共 3 块/);
+  assert.match(reader.innerHTML, /下一组/);
+  const next = reader.querySelector("#d-read-next");
+  assert.equal(next.disabled, false, "有 next_offset 时下一组应可点");
+
+  // 文档内检索：query 必须进 URL，结果按命中/上下文渲染。
+  reader.querySelector("#d-query").value = "林澈";
+  reader.querySelector("#d-query-run").onclick();
+  await flush();
+  const searchCall = takeCall("/api/document");
+  assert.match(searchCall.path, /query=%E6%9E%97%E6%BE%88/);
+  searchCall.resolve(jsonResp(200, { ok: true, knowledge_base_id: "kb-1",
+    document: { knowledge_id: "doc-1", title: "青岚计划.pdf", parse_status: "completed",
+                chunk_count: 3 },
+    chunks: [{ chunk_id: "c-1", chunk_index: 0, role: "match", content: "负责人林澈。",
+               match_snippet: "林澈" }],
+    total_chunks: 3, fetched_chunks: 1, offset: 0, page_size: 8,
+    query: "林澈", match_count: 1, truncated: false, next_offset: null }));
+  await flush();
+  assert.match(section.querySelector("#d-reader").innerHTML, /命中/);
+  assert.match(section.querySelector("#d-reader").innerHTML, /林澈/);
+});
