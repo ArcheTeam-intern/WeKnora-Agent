@@ -9,3 +9,6 @@ __pycache__/
 
 # 演示控制台的本地账号档案（含明文密码，仅本机使用）
 accounts.json
+
+# 本地验收/规划脚本与一次性凭证（.planning/tokens 含明文账号）
+.planning/
