@@ -707,10 +707,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   window.addEventListener("hashchange", applyRoute);
   applyRoute();
 
-  const info = await api("/api/info", { brief: "GET info" });
-  if (info.ok && info.data) {
-    document.title = `WeKnora MCP 控制台 · ${info.data.model || ""}`;
-  }
+  // 标题固定为产品名。把 /api/info 的模型名拼进标签页会误导——控制台可以随时
+  // 换模型，也不代表当前连接的就是那个模型。/api/info 仍保留：它是启动期的连通性
+  // 探测，也记在「MCP 调用轨迹」里。
+  document.title = "WeKnora MCP 控制台";
+  await api("/api/info", { brief: "GET info" });
   if (activeProfile()) await refreshAfterIdentity();
   else toast("点击「配置 Token」，导入有效的 WeKnora 用户凭证");
   setInterval(updateTokenStatus, 30000);
