@@ -701,7 +701,7 @@ function materialsMount(section) {
   }
 
   /* ===================== 视图二：知识库文档管理 ===================== */
-  // 全部读写都走五工具核心：read_document.list 出目录，read_document.read
+  // 全部读写都走知识核心：read_document.list 出目录，read_document.read
   // 出正文（query 即文档内字面检索）。页面只做展示，不缓存跨身份的文档。
   const D = {
     mounted: false, kbId: "", loadedKb: "", docs: [], total: 0, page: 1, pageSize: 10,
@@ -1126,7 +1126,7 @@ function materialsMount(section) {
 
   /* ===================== 视图三：问答 ===================== */
 // Q.scopeAll/qbIds/mode 由 app.js 的状态渲染；问答只走 WeKnora 原生 ask。
-  const Q = { sessionId: "", busy: false, mounted: false };
+  const Q = { sessionId: "", busy: false, mounted: false, agents: [], agentsSeq: 0, agentsLoading: false };
 
   function qaScopeChips(section) {
     const box = section.querySelector("#qa-kbs");
@@ -1188,11 +1188,37 @@ function materialsMount(section) {
     const send = section.querySelector("#qa-send");
     const input = section.querySelector("#qa-q");
     if (!send) return;
-    const ready = qaScopeChosen() && !!window.App.activeProfile();
+    const ready = qaScopeChosen() && !!window.App.activeProfile() && qaAgentReady();
     send.disabled = !ready || Q.busy;
     if (input) input.placeholder = ready
       ? "输入问题，Enter 发送（Shift+Enter 换行）"
       : "先选择问答知识库范围再提问";
+  }
+
+  function qaAgentReady() {
+    return S.qaMode !== 'agent' || !!(window.AgentWorkspace && window.AgentWorkspace.available() && !Q.agentsLoading && Q.agents.some(a=>a.id===S.qaAgentId));
+  }
+  function renderQaAgentMode(section) {
+    const picker=section.querySelector('#qa-agent-picker');if(picker)picker.hidden=S.qaMode!=='agent';
+    section.querySelectorAll('#qa-mode button').forEach(btn=>{btn.classList.toggle('on',(btn.dataset.mode || '')===(S.qaMode || ''));if(btn.dataset.mode==='agent'){btn.disabled=!(window.AgentWorkspace && window.AgentWorkspace.available());btn.title=btn.disabled?'当前端点未提供智能体管理工具':'使用原生智能体配置回答';}});
+  }
+  async function syncQaAgents(section,refresh=false) {
+    renderQaAgentMode(section);
+    const select=section.querySelector('#qa-agent'),notice=section.querySelector('#qa-agent-status');if(!select || !notice)return;
+    const seq=++Q.agentsSeq,epoch=captureIdentityEpoch();
+    if(!window.AgentWorkspace || !window.AgentWorkspace.available()) {
+      Q.agents=[];Q.agentsLoading=false;select.disabled=true;notice.textContent='当前端点未提供 agent_workspace，无法指定智能体；可使用端点默认或原生问答模式。';updateQaSendState(section);return;
+    }
+    if(!window.App.activeProfile()){Q.agents=[];select.disabled=true;notice.textContent='连接账号后加载可用智能体。';updateQaSendState(section);return;}
+    Q.agentsLoading=true;select.disabled=true;notice.textContent='正在加载可用智能体…';updateQaSendState(section);
+    try {
+      const agents=await window.AgentWorkspace.list(refresh);if(seq!==Q.agentsSeq || !isCurrentIdentityEpoch(epoch))return;
+      Q.agents=agents;select.innerHTML='';const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='选择一个原生智能体';select.appendChild(placeholder);
+      agents.forEach(agent=>{const option=document.createElement('option');option.value=agent.id;option.textContent=agent.name+(agent.is_builtin?'（内置）':'');select.appendChild(option);});
+      if(S.qaAgentId && !agents.some(a=>a.id===S.qaAgentId)){S.qaAgentId='';if(S.qaMode==='agent')setQaScopeChanged(section);}
+      select.value=S.qaAgentId || '';notice.textContent=agents.length?'此页指定的知识库优先；选择全部可用时，仍使用智能体自身的默认知识库范围。':'暂无可用智能体，可先在智能体管理中新建。';select.disabled=!agents.length;
+    } catch(e) {if(seq===Q.agentsSeq && isCurrentIdentityEpoch(epoch)){Q.agents=[];notice.textContent='智能体加载失败：'+(e.message || '请重试');select.disabled=true;}}
+    finally {if(seq===Q.agentsSeq && isCurrentIdentityEpoch(epoch)){Q.agentsLoading=false;updateQaSendState(section);}}
   }
 
   function qaMount(section) {
@@ -1211,12 +1237,14 @@ function materialsMount(section) {
               <button data-mode="" class="on">端点默认</button>
               <button data-mode="quick-answer">原生快速问答</button>
               <button data-mode="smart-reasoning">原生智能推理</button>
+              <button data-mode="agent">指定智能体</button>
             </div></label>
           <span class="grow"></span>
           <span class="kv">session：<b id="qa-session" class="mono">–</b></span>
           <button id="qa-new" class="btn ghost small">新会话</button>
         </div>
-        <div class="sub" id="qa-hint">问答经五工具核心的 <span class="mono">ask</span> 提交（<span class="mono">/mcp/core/:id</span>），
+        <div id="qa-agent-picker" class="qa-agent-picker" hidden><label class="field"><span>选择原生智能体</span><select id="qa-agent" class="input" aria-label="问答智能体"></select></label><p id="qa-agent-status" class="sub" role="status"></p><button id="qa-agents-refresh" class="btn ghost small" type="button">刷新智能体列表</button></div>
+        <div class="sub" id="qa-hint">问答经知识核心的 <span class="mono">ask</span> 提交（<span class="mono">/mcp/core/:id</span>），
         mode 由 WeKnora 校验生效；「端点默认」使用端点配置的问答档案（本控制台只走 WeKnora 自己的问答链，不再内置其他编排框架）。</div>
       </div>
       <div id="qa-msgs"><div class="empty">还没有对话。选择范围后输入问题开始。</div></div>
@@ -1237,8 +1265,15 @@ function materialsMount(section) {
         saveScope();
         section.querySelectorAll("#qa-mode button").forEach(b => b.classList.toggle("on", b === btn));
         setQaScopeChanged(section);
+        renderQaAgentMode(section);
+        if(S.qaMode==='agent')syncQaAgents(section);
       };
     });
+    section.querySelector("#qa-agent").onchange=()=>{
+      const selected=section.querySelector("#qa-agent").value;
+      S.qaAgentId=Q.agents.some(a=>a.id===selected)?selected:"";saveScope();setQaScopeChanged(section);
+    };
+    section.querySelector("#qa-agents-refresh").onclick=()=>syncQaAgents(section,true);
     section.querySelector("#qa-new").onclick = () => {
       Q.sessionId = "";
       section.querySelector("#qa-session").textContent = "–";
@@ -1277,6 +1312,7 @@ function materialsMount(section) {
     renderQaScopeLine(section);
     updateQaSendState(section);
     Q.mounted = true;
+    syncQaAgents(section);
   }
 
   // stripThinking removes the model's reasoning wrapper from a final answer:
@@ -1315,6 +1351,7 @@ function materialsMount(section) {
     const scopeEpoch = window.App.captureQaEpoch();
     if (!window.App.activeProfile()) { toast("请先配置有效 Token", "err"); return; }
     if (!qaScopeChosen()) { toast("请先选择问答知识库范围（或「全部可用」）", "err"); return; }
+    if(!qaAgentReady()){toast("请先选择一个可用的智能体", "err");return;}
     const input = section.querySelector("#qa-q");
     const question = input.value.trim();
     if (!question) return;
@@ -1352,7 +1389,9 @@ function materialsMount(section) {
     try {
       // 只用 WeKnora 自己的问答链：原生 ask（mode 经 MCP 参数提交）。
       const payload = { question, session_id: Q.sessionId || undefined };
-      if (S.qaMode) payload.mode = S.qaMode;
+      if (!S.qaScopeAll) payload.knowledge_base_ids = [...S.qaKbIds];
+      if (S.qaMode === "agent") payload.agent_id = S.qaAgentId;
+      else if (S.qaMode) payload.mode = S.qaMode;
       await sse("/api/ask", payload, evt => {
         if (stale()) return;
         if (evt.type === "status") statusEl.textContent = evt.text;
@@ -1362,6 +1401,10 @@ function materialsMount(section) {
           const rendered = renderCitations(answer);
           answerEl.innerHTML = renderMarkdown(rendered.text);
           const meta = [];
+          if (evt.agent_id) {
+            const agent=Q.agents.find(item=>item.id===evt.agent_id);
+            meta.push('智能体 '+(agent && agent.name || evt.agent_id));
+          }
           if (evt.mode) meta.push(`模式 ${evt.mode}`);
           if (Array.isArray(evt.knowledge_base_ids) && evt.knowledge_base_ids.length) {
             meta.push(`范围 ${evt.knowledge_base_ids.length} 库`);
@@ -1440,11 +1483,27 @@ function materialsMount(section) {
     if (name === "search_knowledge") return "检索";
     if (name === "read_document") return "读取";
     if (name === "ask") return "问答";
+    if (name === "agent_workspace") return "智能体管理";
+    if (name === "wiki_workspace") return "Wiki 管理";
     return "其他";
   }
 
-  /* ---- 五工具的使用说明与自测步骤（诊断页展示，中文） ---- */
+  /* ---- 核心工具的使用说明与自测步骤（诊断页展示，中文） ---- */
   const TOOL_USAGE = {
+    agent_workspace: {
+      purpose: "管理 WeKnora 原生智能体，并在知识问答中选择执行；配置仍由 WeKnora 保存。",
+      actions: [["list / get", "列出可见智能体、读取知识问答配置"], ["create / update", "新建或编辑名称、提示词、模型、运行方式和默认选库"], ["copy / delete", "复制为自己的智能体，或删除有权管理的自定义智能体；内置项只读"]],
+      steps: ["先 list/get 查看可见资源；日常维护使用智能体管理页面。", "在问答页选指定智能体，传 agent_id；不要同时传 mode/profile_id。", "检查响应 agent_id 和 knowledge_base_ids；配置或范围变化后使用新会话。"],
+      expect: "返回真实 agents / agent / deleted；无许可、越权或不支持的配置明确拒绝。",
+      pitfalls: "需要端点显式启用 agent_workspace 和真实用户身份。知识库选全部可用表示不额外收窄，仍遵循智能体默认选库；智能推理需要可用模型配置。",
+    },
+    wiki_workspace: {
+      purpose: "维护原生 Wiki 页面和页面链接图。写入仍由 WeKnora 的端点许可、用户角色与知识库权限校验。",
+      actions: [["get", "读取可编辑原始页面和当前版本"], ["create / update / delete", "新建、编辑、删除页面；编辑提交读取到的版本"], ["revisions / restore", "查看历史快照、恢复历史版本"], ["graph", "浏览 Wiki 页面正文链接构成的图，和实体抽取图不同"]],
+      steps: ["从 Wiki 页面选库并阅读；需要写入时打开管理按钮。", "编辑前 get 获取当前版本；保存后回读，确认正文、版本与链接已经更新。", "写入未获许可时返回明确拒绝；不能通过只读 Wiki 工具绕过。"],
+      expect: "返回真实 page / revisions / graph；版本冲突应提示重读，不覆盖他人的修改。",
+      pitfalls: "端点未启用 wiki_workspace 时需要端点管理员授权。页面链接来自 [[slug|标题]]，可编辑源页面维护；不支持直接改实体抽取数据库。",
+    },
     knowledge_base: {
       purpose: "知识库目录与配置：列库、看单个库的能力与解析器目录、按需建库。其他工具的选库依据都在这里取得。",
       actions: [
@@ -1503,7 +1562,7 @@ function materialsMount(section) {
       pitfalls: "列表动作 knowledge_base_id 必填；Wiki 的 read 需要 knowledge_base_id 与 slug 同时给出；文档未解析完成时正文可能为空。",
     },
     ask: {
-      purpose: "让 WeKnora 用自己的问答链回答：可选内置模式或端点发布的问答档案，返回回答、引用与 session_id。",
+      purpose: "让 WeKnora 用自己的问答链回答：可选内置模式、端点发布的问答档案或原生 agent_id，返回回答、引用、实际智能体与 session_id。",
       actions: [
         ["（单动作）", "省略 mode 用端点默认档案；mode=quick-answer / smart-reasoning 钉住内置模式；带 session_id 续问同一会话。"],
       ],
@@ -1589,14 +1648,14 @@ function materialsMount(section) {
     section.innerHTML = `
       <div class="card">
         <h3>开发诊断</h3>
-        <div class="sub">这一页给开发和验证用，普通演示流程在「资料解析」和「知识问答」两页即可完成。<br>
+        <div class="sub">这一页用于开发验证。产品能力可从知识库概览、资料解析、文档、统一检索、Wiki、图谱和问答页面体验。<br>
         用法：左边挑一个工具 → 中间填参数（表单或 JSON）→ 点「运行」→ 下方看中文结论和原始返回。
         所有调用都走真实的 MCP 工具，右上角「MCP 调用轨迹」里有原始请求。</div>
       </div>
       <div class="bench">
         <div class="card">
           <h3>工具目录</h3>
-          <div class="sub">共 <b id="b-count">0</b> 个工具，来自五工具知识核心的 <span class="mono">tools/list</span>
+          <div class="sub">共 <b id="b-count">0</b> 个工具，来自知识核心的 <span class="mono">tools/list</span>
           （<span class="mono">/mcp/core/:id</span>，配置 Token 后加载）。标「写」的会修改知识库数据，运行前会二次确认。</div>
           <input id="b-filter" class="input wide" placeholder="按中文名或工具名过滤…">
           <div class="tool-list" id="b-list" style="margin-top:10px"></div>
@@ -1607,7 +1666,7 @@ function materialsMount(section) {
       </div>
       <div class="card">
         <h3>MCP 验证清单</h3>
-        <div class="sub">对着「上传目标知识库」（或最近导入的那篇文档）把五工具核心的读取动作跑一遍：
+        <div class="sub">对着「上传目标知识库」（或最近导入的那篇文档）把知识核心的读取动作跑一遍：
         知识库列表/详情 → 导入状态 → 读原文 → 列文档 → 检索（含字面匹配）→ Wiki 目录/页面 → Wiki 检索 → 图谱检索。
         知识库没开启的能力会自动跳过并写明原因；红色叉才是工具本身失败。</div>
         <div class="row">
@@ -1972,7 +2031,7 @@ function materialsMount(section) {
       method: "POST",
       json: { name: "read_document",
               arguments: { action: "list", source_type: "wiki", knowledge_base_id: kbId } },
-      headers: materialsHeaders(), brief: "取示例 Wiki 页",
+      headers: mcpHeaders({ kbIds: [kbId] }), brief: "取示例 Wiki 页",
     });
     const block = ((r.data && r.data.result) || {}).wiki || {};
     const slug = findFirstSlug(block);
@@ -1985,6 +2044,20 @@ function materialsMount(section) {
 
   // TOOL_EXAMPLES：每个工具的可直接运行示例，按顺序循环；参数全部来自当前真实状态。
   const TOOL_EXAMPLES = {
+    wiki_workspace: [
+      { label: "get：读取原生 Wiki 页面与版本", expect: "page 含原始 Markdown 与 version；不改变数据", build: async () => {
+        const kb = capableKbs("wiki")[0]; if (!kb) throw new Error("没有可见的 Wiki 知识库");
+        const ex = await exampleWikiPage(kb.id); return { args: { action: "get", knowledge_base_id: kb.id, slug: ex.wikiSlug } };
+      } },
+      { label: "graph：原生页面链接图概览", expect: "graph 返回页面节点、正文链接与范围元数据", build: async () => {
+        const kb = capableKbs("wiki")[0]; if (!kb) throw new Error("没有可见的 Wiki 知识库");
+        return { args: { action: "graph", knowledge_base_id: kb.id, depth: 1, limit: 30 } };
+      } },
+      { label: "revisions：查看历史版本", expect: "返回 revisions、total、current_version；新页可能没有快照", build: async () => {
+        const kb = capableKbs("wiki")[0]; if (!kb) throw new Error("没有可见的 Wiki 知识库");
+        const ex = await exampleWikiPage(kb.id); return { args: { action: "revisions", knowledge_base_id: kb.id, slug: ex.wikiSlug, limit: 20, offset: 0 } };
+      } },
+    ],
     knowledge_base: [
       { label: "list：列出可见知识库",
         expect: "knowledge_bases 非空，每个库带能力标记",
@@ -2206,18 +2279,21 @@ function materialsMount(section) {
                             mounted: false, preview: null, lastStatus: null, lastPhases: null,
                             idemAuto: true });
       docPollSeq++;  // 旧身份的轮询循环立即失效
-      Object.assign(Q, { sessionId: "", busy: false, mounted: false });
+      Object.assign(Q, { sessionId: "", busy: false, mounted: false, agents: [], agentsSeq: Q.agentsSeq+1, agentsLoading: false });
       Object.assign(B, { tool: null, mounted: false });
       Object.assign(D, { mounted: false, kbId: "", loadedKb: "", docs: [], total: 0,
                              page: 1, selectedId: "", selected: null, doc: null, chunks: [],
                              query: "", error: "", readError: "", loading: false,
                              readLoading: false, reqSeq: D.reqSeq + 1, readSeq: D.readSeq + 1 });
-      for (const name of ["materials", "docs", "qa", "bench"]) {
+      for (const view of Object.values(window.KnowledgeViews || {})) view.reset();
+      for (const name of ["library", "materials", "docs", "search", "wiki", "graph", "agents", "qa", "bench"]) {
         document.getElementById("view-" + name).innerHTML = "";
       }
       this.show(S.ui.view, document.getElementById("view-" + S.ui.view));
     },
     show(name, section) {
+      const productView = (window.KnowledgeViews || {})[name];
+      if (productView) { productView.show(section); return; }
       if (name === "materials" && !M.mounted) materialsMount(section);
       if (name === "docs" && !D.mounted) docsMount(section);
       if (name === "qa" && !Q.mounted) qaMount(section);
@@ -2225,9 +2301,10 @@ function materialsMount(section) {
       if (name === "bench" && B.mounted) renderToolList(section, "");
       if (name === "materials") { syncKbSelect(section); syncEngineSelect(section); }
       if (name === "docs" && D.mounted) syncDocsKb(section);
-      if (name === "qa") { qaScopeChips(section); renderQaScopeLine(section); updateQaSendState(section); }
+      if (name === "qa") { qaScopeChips(section); renderQaScopeLine(section); updateQaSendState(section); syncQaAgents(section); }
     },
     onSelectionChanged() {
+      for (const view of Object.values(window.KnowledgeViews || {})) view.selectionChanged();
       if (M.mounted) {
         const materials = document.getElementById("view-materials");
         syncKbSelect(materials);
@@ -2239,8 +2316,22 @@ function materialsMount(section) {
         qaScopeChips(qa);
         renderQaScopeLine(qa);
         updateQaSendState(qa);
+        syncQaAgents(qa);
       }
       if (B.mounted) renderToolList(document.getElementById("view-bench"), "");
+    },
+    openQaForAgent(agentId) {
+      if(!agentId || !window.AgentWorkspace || !window.AgentWorkspace.available() || !window.App.activeProfile())return;
+      S.qaMode='agent';S.qaAgentId=agentId;
+      window.App.saveScope();window.App.advanceQaEpoch();
+      this.show('qa',document.getElementById('view-qa'));
+      window.location.hash='#/qa';
+    },
+    onAgentsChanged() {
+      if(!Q.mounted)return;
+      // Native agent edits may change the server's session-bound scope even when its ID stays the same.
+      if(S.qaMode==='agent')window.App.advanceQaEpoch();
+      syncQaAgents(document.getElementById("view-qa"));
     },
     // resetQaScopeState: 问答范围/模式变化时开启新会话的视图侧动作。
     resetQaScopeState() {

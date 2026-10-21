@@ -1,9 +1,9 @@
 """MCP verification console — a thin web shell over WeKnora's knowledge core.
 
 The console exists to prove the MCP packing the main product will consume:
-every action on the page is one or more calls to the FIVE-TOOL core surface
+every action on the page is one or more calls to the SIX-TOOL core surface
 (/mcp/core/<endpoint_id> — knowledge_base, ingest_document, search_knowledge,
-read_document, ask), and the raw JSON-RPC request/response of each call is
+read_document, ask, wiki_workspace), and the raw JSON-RPC request/response of each call is
 visible in the UI. The legacy 22-tool catalogue stays mounted at
 /mcp/<endpoint_id> for old clients; this console no longer calls it.
 
@@ -81,6 +81,8 @@ _OPTIONAL_HEADERS = (
 # UI, so only ingest_document carries the badge here.
 DESTRUCTIVE_TOOLS = frozenset({
     "ingest_document",
+    "wiki_workspace",
+    "agent_workspace",
 })
 
 # --- identity header relay --------------------------------------------------
@@ -119,7 +121,7 @@ def _build_connection(endpoint_token: str, user_headers: dict[str, str]):
     """Snapshot a copy of mcp.json with the required headers pre-bound to
     this specific request. Each call gets its own dict so concurrent
     requests do not share state. Both the LangChain agent and the console
-    speak to the five-tool core surface, so the default rewrite applies.
+    speak to the core MCP surface, so the default rewrite applies.
     """
     return load_connections(ROOT / "mcp.json", header_overrides={
         "Authorization": "Bearer " + endpoint_token, **user_headers})
@@ -133,7 +135,7 @@ def _endpoint_token() -> str:
 def _mcp_endpoint_target() -> tuple[str, str]:
     """Return (weknora_base_url, endpoint_id) from mcp.json / .env.
 
-    The console's deterministic flows call the five-tool knowledge core
+    The console's deterministic flows call the knowledge core
     (/mcp/core/<id>), so both the plain /mcp/<id> form and an already
     rewritten /mcp/core/<id> URL resolve to the same base + endpoint id.
     The configuration is read WITHOUT the LangChain rewrite here because the
@@ -442,7 +444,7 @@ async def chat(request: Request):
 # --- direct ask tool (MCP mode) --------------------------------------------
 
 async def _stream_ask(question: str, session_id: str, user_headers: dict[str, str],
-                      mode: str = ""):
+                      mode: str = "", agent_id: str = "", knowledge_base_ids: list[str] | None = None):
     """One direct `ask` MCP call streamed as SSE. This is the shape the
     main product will use when it wants WeKnora's own answer pipeline
     rather than letting its own model orchestrate the tools. `mode` selects
@@ -455,6 +457,10 @@ async def _stream_ask(question: str, session_id: str, user_headers: dict[str, st
         arguments["session_id"] = session_id
     if mode:
         arguments["mode"] = mode
+    if agent_id:
+        arguments["agent_id"] = agent_id
+    if knowledge_base_ids is not None:
+        arguments["knowledge_base_ids"] = knowledge_base_ids
     r = await _call_tool("ask", arguments, user_headers, timeout=ASK_TIMEOUT)
     if not r["ok"]:
         yield {"data": json.dumps(
@@ -488,9 +494,17 @@ async def ask(request: Request):
     question = (body.get("question") or "").strip()
     session_id = (body.get("session_id") or "").strip()
     mode = (body.get("mode") or "").strip()
+    agent_id = body.get("agent_id") or ""
+    if not isinstance(agent_id, str):
+        return JSONResponse({"error": "agent_id must be a string"}, status_code=400)
+    agent_id = agent_id.strip()
+    knowledge_base_ids = body.get("knowledge_base_ids")
+    if knowledge_base_ids is not None and (not isinstance(knowledge_base_ids, list)
+            or any(not isinstance(item, str) for item in knowledge_base_ids)):
+        return JSONResponse({"error": "knowledge_base_ids must be a list of strings"}, status_code=400)
     if not question:
         return JSONResponse({"error": "question is required"}, status_code=400)
-    return EventSourceResponse(_stream_ask(question, session_id, user_headers, mode), ping=15)
+    return EventSourceResponse(_stream_ask(question, session_id, user_headers, mode, agent_id, knowledge_base_ids), ping=15)
 
 
 # --- verification checklist (SSE) ------------------------------------------

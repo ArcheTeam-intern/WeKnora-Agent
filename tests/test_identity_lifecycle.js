@@ -54,7 +54,13 @@ class El {
     if (!this._query.has(sel)) { const el = new El(); el.parentNode = this; el._selector = sel; this._query.set(sel, el); }
     return this._query.get(sel);
   }
-  querySelectorAll() { return []; }
+  querySelectorAll(selector) {
+    if(selector === '#qa-mode button') {
+      if(!this._modeButtons)this._modeButtons=Array.from(this.innerHTML.matchAll(/data-mode="([^"]*)"/g),m=>{const b=new El('button');b.dataset.mode=m[1];return b;});
+      return this._modeButtons;
+    }
+    return [];
+  }
 }
 function makeDocument() {
   const byId = new Map();
@@ -761,4 +767,86 @@ test("the document page lists a library and reads chunks through MCP", async () 
   await flush();
   assert.match(section.querySelector("#d-reader").innerHTML, /命中/);
   assert.match(section.querySelector("#d-reader").innerHTML, /林澈/);
+});
+
+
+test("QA specified agent sends agent_id exclusively and changing agents discards late sessions", async()=>{
+  const w=boot();setIdentity(w,'a@example.com','token-a');w.App.S.qaScopeAll=true;
+  w.AgentWorkspace={available:()=>true,list:async()=>[{id:'agent-a',name:'Agent A'},{id:'agent-b',name:'Agent B'}]};
+  const section=w.document.getElementById('view-qa');w.Views.show('qa',section);await flush();
+  const agentMode=section.querySelectorAll('#qa-mode button').find(b=>b.dataset.mode==='agent');assert.ok(agentMode);agentMode.onclick();await flush();
+  const picker=section.querySelector('#qa-agent');picker.value='agent-a';picker.onchange();
+  w.App.S.qaScopeAll=false;w.App.S.qaKbIds=['kb-selected'];
+  section.querySelector('#qa-q').value='Question A';section.querySelector('#qa-send').onclick();await flush();
+  const first=takeCall('/api/ask'),args=JSON.parse(first.opts.body);assert.equal(args.agent_id,'agent-a');assert.equal(args.mode,undefined);assert.equal(args.profile_id,undefined);assert.deepEqual(args.knowledge_base_ids,['kb-selected']);
+  const before=w.App.captureQaEpoch();picker.value='agent-b';picker.onchange();assert.ok(w.App.captureQaEpoch()>before);
+  section.querySelector('#qa-q').value='Question B';section.querySelector('#qa-send').onclick();await flush();
+  const second=takeCall('/api/ask');assert.equal(JSON.parse(second.opts.body).agent_id,'agent-b');assert.equal(JSON.parse(second.opts.body).session_id,undefined);
+  first.resolve(sseResp([frame({type:'answer',text:'OLD',session_id:'old-session'})]));await flush();
+  assert.equal(section.querySelector('#qa-send').disabled,true);assert.doesNotMatch(section.querySelector('#qa-session').textContent,/old-session/);
+  second.resolve(sseResp([frame({type:'answer',text:'NEW',session_id:'new-session'})]));await flush();assert.match(section.querySelector('#qa-session').textContent,/new-session/);
+  section.querySelectorAll('#qa-mode button').find(b=>b.dataset.mode==='quick-answer').onclick();
+  section.querySelector('#qa-q').value='Quick';section.querySelector('#qa-send').onclick();await flush();
+  const quick=JSON.parse(takeCall('/api/ask').opts.body);assert.equal(quick.mode,'quick-answer');assert.equal(quick.agent_id,undefined);assert.equal(quick.session_id,undefined);
+});
+
+test("QA missing agent tool blocks specified-agent questions and identity reset clears selection",async()=>{
+  const w=boot();setIdentity(w,'a@example.com','token-a');w.App.S.qaScopeAll=true;w.App.S.qaMode='agent';w.App.S.qaAgentId='old-agent';
+  const section=w.document.getElementById('view-qa');w.Views.show('qa',section);await flush();
+  assert.equal(section.querySelector('#qa-send').disabled,true);assert.match(section.querySelector('#qa-agent-status').textContent,/未提供/);
+  w.App.setActiveProfile('a@example.com');assert.equal(w.App.S.qaAgentId,'');
+});
+
+test('editing the selected native agent invalidates its bound QA session and suppresses the old stream',async()=>{
+  const w=boot();setIdentity(w,'a@example.com','token-a');w.App.S.qaScopeAll=true;w.App.S.qaMode='agent';w.App.S.qaAgentId='same-agent';
+  let knowledgeBases=['kb-a'];
+  w.AgentWorkspace={available:()=>true,list:async()=>[{id:'same-agent',name:'Agent',config:{kb_selection_mode:'selected',knowledge_bases:knowledgeBases}}]};
+  const section=w.document.getElementById('view-qa');w.Views.show('qa',section);await flush();
+  const ask=async question=>{section.querySelector('#qa-q').value=question;section.querySelector('#qa-send').onclick();await flush();return takeCall('/api/ask');};
+  const first=await ask('Before edit');first.resolve(sseResp([frame({type:'answer',text:'Before',session_id:'old-bound-session'})]));await flush();
+  const oldStream=await ask('In flight before edit');assert.equal(JSON.parse(oldStream.opts.body).session_id,'old-bound-session');
+  const epoch=w.App.captureQaEpoch();knowledgeBases=['kb-b'];w.Views.onAgentsChanged();await flush();
+  assert.ok(w.App.captureQaEpoch()>epoch);assert.equal(section.querySelector('#qa-session').textContent,'–');assert.equal(w.App.S.qaAgentId,'same-agent');
+  const fresh=await ask('After edit');const payload=JSON.parse(fresh.opts.body);assert.equal(payload.agent_id,'same-agent');assert.equal(payload.session_id,undefined);
+  oldStream.resolve(sseResp([frame({type:'answer',text:'Obsolete',session_id:'old-bound-session'})]));await flush();
+  assert.equal(section.querySelector('#qa-send').disabled,true);assert.equal(section.querySelector('#qa-session').textContent,'–');
+  fresh.resolve(sseResp([frame({type:'answer',text:'Current',session_id:'new-bound-session'})]));await flush();
+  assert.match(section.querySelector('#qa-session').textContent,/new-bound/);
+});
+
+for(const mode of ['quick-answer','smart-reasoning'])test('agent configuration notifications preserve unrelated '+mode+' sessions',async()=>{
+  const w=boot();setIdentity(w,'a@example.com','token-a');w.App.S.qaScopeAll=true;w.App.S.qaMode=mode;
+  w.AgentWorkspace={available:()=>true,list:async()=>[{id:'agent',name:'Agent'}]};
+  const section=w.document.getElementById('view-qa');w.Views.show('qa',section);await flush();
+  section.querySelector('#qa-q').value='Before';section.querySelector('#qa-send').onclick();await flush();
+  takeCall('/api/ask').resolve(sseResp([frame({type:'answer',text:'Answer',session_id:'mode-session'})]));await flush();
+  const epoch=w.App.captureQaEpoch();w.Views.onAgentsChanged();await flush();assert.equal(w.App.captureQaEpoch(),epoch);
+  section.querySelector('#qa-q').value='After';section.querySelector('#qa-send').onclick();await flush();
+  const payload=JSON.parse(takeCall('/api/ask').opts.body);assert.equal(payload.mode,mode);assert.equal(payload.session_id,'mode-session');
+});
+
+test('opening QA from agent detail updates an already mounted picker while preserving the chosen KB scope',async()=>{
+  const w=boot();setIdentity(w,'a@example.com','token-a');w.App.S.qaScopeAll=false;w.App.S.qaKbIds=['kb-existing'];w.App.S.qaMode='quick-answer';
+  w.AgentWorkspace={available:()=>true,list:async()=>[{id:'chosen-agent',name:'Chosen'}]};
+  const section=w.document.getElementById('view-qa');w.Views.show('qa',section);await flush();
+  section.querySelector('#qa-q').value='First';section.querySelector('#qa-send').onclick();await flush();
+  takeCall('/api/ask').resolve(sseResp([frame({type:'answer',text:'Old answer',session_id:'old-quick-session'})]));await flush();
+  const epoch=w.App.captureQaEpoch();w.Views.openQaForAgent('chosen-agent');await flush();
+  assert.ok(w.App.captureQaEpoch()>epoch);assert.equal(w.App.S.qaMode,'agent');assert.equal(w.App.S.qaAgentId,'chosen-agent');
+  assert.deepEqual(Array.from(w.App.S.qaKbIds),['kb-existing']);assert.equal(w.App.S.qaScopeAll,false);assert.equal(w.location.hash,'#/qa');
+  assert.equal(section.querySelector('#qa-agent').value,'chosen-agent');assert.equal(section.querySelector('#qa-agent-picker').hidden,false);
+  assert.equal(section.querySelectorAll('#qa-mode button').find(b=>b.dataset.mode==='agent').classList.contains('on'),true);
+  assert.equal(section.querySelectorAll('#qa-mode button').find(b=>b.dataset.mode==='quick-answer').classList.contains('on'),false);
+  section.querySelector('#qa-q').value='Agent question';section.querySelector('#qa-send').onclick();await flush();
+  const payload=JSON.parse(takeCall('/api/ask').opts.body);assert.equal(payload.agent_id,'chosen-agent');assert.equal(payload.session_id,undefined);assert.deepEqual(payload.knowledge_base_ids,['kb-existing']);
+});
+
+for(const [responseId,label] of [['actual-agent','Actual Name'],['unlisted-agent','unlisted-agent']])test('QA answer identifies the response native agent as '+label,async()=>{
+  const w=boot();setIdentity(w,'a@example.com','token-a');w.App.S.qaScopeAll=true;w.App.S.qaMode='agent';w.App.S.qaAgentId='requested-agent';
+  w.AgentWorkspace={available:()=>true,list:async()=>[{id:'requested-agent',name:'Requested Name'},{id:'actual-agent',name:'Actual Name'}]};
+  const section=w.document.getElementById('view-qa');w.Views.show('qa',section);await flush();
+  section.querySelector('#qa-q').value='Question';section.querySelector('#qa-send').onclick();await flush();
+  takeCall('/api/ask').resolve(sseResp([frame({type:'answer',text:'Answer',agent_id:responseId,mode:'smart-reasoning',knowledge_base_ids:['kb'],session_id:'session'})]));await flush();
+  const ai=section.querySelector('#qa-msgs').children.filter(child=>child.classList.contains('ai')).pop();
+  const badge=ai.querySelector('.refs').children[0];assert.match(badge.textContent,new RegExp('智能体 '+label));assert.match(badge.textContent,/smart-reasoning/);assert.match(badge.textContent,/范围 1 库/);
 });

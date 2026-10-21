@@ -6,12 +6,13 @@ const S = {
   profiles: [],           // 浏览器本地档案（含 token）
   activeEmail: "",
   kbs: [],                // knowledge_base.list 结果
-  tools: [],              // tools/list 结果（五工具 core 面）
+  tools: [],              // tools/list 结果（核心工具 core 面）
   // KB 范围按页面拆分：资料页只有一个上传目标；问答页有自己的检索范围与
   // 原生模式。两者互不干扰，也都不再由顶栏统一编辑。
   uploadTargetKbId: "",   // 资料页：上传/导入/状态请求只带这个库
   qaKbIds: [],            // 问答页：ask/chat 的检索范围（空 = 未选）
   qaScopeAll: false,      // 问答页显式选择「全部可用」时才不收窄
+  qaAgentId: "",          // 当前身份在问答页选择的原生智能体
   qaMode: "",             // "" = 端点默认；quick-answer / smart-reasoning
   engines: [],            // knowledge_base.get 的解析器目录（资料页解析方式）
   endpoint: null,
@@ -42,6 +43,7 @@ function resetIdentityScopedState() {
   S.uploadTargetKbId = "";
   S.qaKbIds = [];
   S.qaScopeAll = false;
+  S.qaAgentId = "";
   S.trace = [];
   saveScope();
   renderTrace();
@@ -168,6 +170,8 @@ const TOOL_CN = {
   search_knowledge: ["检索证据", "在文档、Wiki、知识图谱里检索：sources 选择来源（document / wiki / graph），mode 选混合 / 语义 / 关键词，match=literal 做字面匹配（核对编号、金额）。"],
   read_document: ["回读原文", "action=list 列出知识库的文档目录或 Wiki 目录；action=read 读回文档正文（可分页）或 Wiki 页面（按 slug），用于核对引用。"],
   ask: ["知识问答", "WeKnora 原生问答：mode 选快速问答 / 智能推理，profile_id 用端点发布的配置，session_id 续问；返回回答与引用。"],
+  agent_workspace: ["智能体管理", "列出、查看、新建、编辑、复制和删除 WeKnora 原生智能体；内置智能体只读，可复制后编辑。问答可通过 agent_id 指定智能体。"],
+  wiki_workspace: ["Wiki 管理", "原生 Wiki 页面的新建、编辑、删除、版本历史与恢复，以及页面链接图。写操作需要端点显式授权和知识库写权限；修改正文中的 [[slug|标题]] 会更新页面链接。"],
 };
 const FIELD_CN = {
   action: "动作",
@@ -177,8 +181,14 @@ const FIELD_CN = {
   enable_wiki: "启用 Wiki", enable_graph: "启用图谱", include_capabilities: "包含能力目录",
   graph_entities: "图谱实体类型", graph_relations: "图谱关系",
   query: "查询词", limit: "条数上限", offset: "起始位置", page: "页码", page_size: "每页条数",
+  agent_id: "智能体", config: "智能体配置", system_prompt: "系统提示词",
+  agent_mode: "问答模式", agent_type: "智能体类型", kb_selection_mode: "知识库选择方式",
+  model_id: "对话模型", rerank_model_id: "重排模型", knowledge_bases: "智能体知识库",
+  retrieve_kb_only_when_mentioned: "仅在提及知识库时检索",
   mode: "模式", profile_id: "问答档案", session_id: "会话 ID", process_config: "解析配置",
   idempotency_key: "上传请求标识", slug: "页面标识", keyword: "关键词",
+  title: "标题", content: "正文", summary: "摘要", page_type: "页面类型", status: "状态",
+  version: "版本号", center: "中心页面标识", depth: "关联深度",
 };
 const PATH_CN = {
   "/api/kbs": "读取知识库列表",
@@ -649,21 +659,26 @@ async function openLoginDialog() {
 
 /* ---------------- 路由 ---------------- */
 function currentRoute() {
-  const m = (location.hash || "").match(/^#\/(materials|docs|qa|bench)/);
+  const m = (location.hash || "").match(/^#\/(library|materials|docs|search|wiki|graph|agents|qa|bench)(?:[/?]|$)/);
   return m ? m[1] : "materials";
 }
 function applyRoute() {
   const route = currentRoute();
   S.ui.view = route;
   const headings = {
+    library: ['你的知识，全貌可见', '查看资料规模、生成状态和可用能力，从这里走向检索与问答。'],
     materials: ['从一份资料开始', '上传、解析、核对原文，让每一次回答都有依据。'],
     docs: ['看清每一份资料', '浏览知识库里的文档，核对状态，读回带序号的分块原文。'],
+    search: ['让证据先说话', '选择知识库与资料来源，对照文档、Wiki 与图谱检索到的证据。'],
+    wiki: ['把资料连成知识', '浏览主题目录、搜索 Wiki 页面，并沿来源核对原文。'],
+    graph: ['沿着关系发现知识', '按实体查询局部关系图，核对每条关系背后的资料。'],
+    agents: ['让智能体按你的方式工作', '管理原生智能体，配置问答方式、系统提示词与知识库范围。'],
     qa: ['向知识提问', '连接你的资料，通过原文与引用找到可靠答案。'],
     bench: ['让每一次调用可见', '浏览可用能力，验证参数、结果与原文来源。'],
   };
   document.getElementById('page-title').textContent = headings[route][0];
   document.getElementById('page-description').textContent = headings[route][1];
-  for (const name of ["materials", "docs", "qa", "bench"]) {
+  for (const name of ["library", "materials", "docs", "search", "wiki", "graph", "agents", "qa", "bench"]) {
     const sec = document.getElementById("view-" + name);
     sec.classList.toggle("hidden", name !== route);
     const nav = document.querySelector(`.nav-item[data-route="${name}"]`);

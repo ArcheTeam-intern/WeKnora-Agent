@@ -1,0 +1,24 @@
+.agent-topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:8px 0 20px; }
+.agent-topbar h2 { font-size:25px; }.agent-topbar p,.agent-status { color:var(--muted); font-size:12px; line-height:1.8; margin-top:10px; }
+.agent-status { min-height:35px; }.agent-status.wiki-error { color:var(--red); }.agent-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.agent-layout { display:grid; grid-template-columns:300px minmax(0,1fr); gap:20px; align-items:start; }
+.agent-list,.agent-reading { border:1px solid var(--line); border-radius:var(--radius); background:var(--card); padding:18px; }
+.agent-list { max-height:70vh; overflow:auto; }
+/* 列表项由 button() 生成，天生带 .btn 的深绿实心底；这里是可点卡片不是主按钮，
+   必须显式还原成白底描边卡，否则白字/灰字压在深绿上完全读不出层级。 */
+.agent-list-item { display:block; width:100%; text-align:left; white-space:normal; padding:14px; margin-bottom:8px; overflow-wrap:anywhere; background:var(--card); color:var(--ink); border:1px solid var(--line); }
+.agent-list-item:hover { background:var(--green-soft); border-color:var(--green); color:var(--ink); transform:none; }
+.agent-list-item.on { background:var(--green-soft); border-color:var(--green); }
+.agent-list-item.on strong { color:var(--green-dark); }
+.agent-list-item strong { display:block; font-size:14px; }.agent-list-item span,.agent-list-item p { display:block; color:var(--muted); font-size:12px; margin-top:6px; line-height:1.7; }
+.agent-detail { padding-top:24px; min-height:300px; overflow-wrap:anywhere; }.agent-detail h3 { font-size:23px; margin:12px 0; }.agent-detail p { line-height:1.9; }
+.agent-kind { display:inline-block; padding:3px 10px; border-radius:999px; background:var(--green-soft); color:var(--green-dark); font-size:12px; font-weight:600; }.agent-meta,.agent-empty { font-size:12px; color:var(--muted); }
+.agent-prompt-preview { white-space:pre-wrap; font:13px/1.9 var(--mono); padding:20px; background:var(--bg); margin:20px 0; border-radius:var(--radius-sm); }
+#modal-box:has(.agent-editor-form) { width:min(820px,94vw); max-height:90vh; overflow:auto; }
+.agent-editor-form { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:20px; }.agent-editor-form .field { min-width:0; }
+.agent-editor-form .field:has(textarea),.agent-editor-form .agent-kb-options,.agent-editor-form .agent-kb-option,.agent-editor-form .wiki-error,.agent-editor-form .modal-actions { grid-column:1/-1; }
+.agent-editor-form textarea { min-height:80px; resize:vertical; line-height:1.7; }.agent-editor-form textarea.agent-prompt-editor { min-height:170px; }
+.agent-kb-options { display:flex; flex-wrap:wrap; gap:12px; }.agent-kb-option { display:flex; gap:8px; align-items:center; font-size:12px; line-height:1.7; }
+.qa-agent-picker { margin:14px 0; }.qa-agent-picker .input { max-width:480px; }.qa-agent-picker .sub { margin-top:8px; }
+@media(max-width:800px){.agent-layout{grid-template-columns:1fr;}.agent-topbar{align-items:stretch;flex-direction:column;}.agent-list{max-height:260px;}}
+@media(max-width:600px){.agent-editor-form{grid-template-columns:1fr;}}

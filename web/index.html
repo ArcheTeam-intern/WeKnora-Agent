@@ -4,7 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WeKnora · 知识工作台</title>
-<link rel="stylesheet" href="/assets/styles.css?v=20261020-docs4">
+<link rel="stylesheet" href="/assets/styles.css?v=20261021-agents2">
+<link rel="stylesheet" href="/assets/explorer.css?v=20261021-agents2">
+<link rel="stylesheet" href="/assets/wiki.css?v=20261021-agents2">
+<link rel="stylesheet" href="/assets/agent.css?v=20261021-agents2">
+<link rel="stylesheet" href="/assets/graph.css?v=20261021-agents2">
 </head>
 <body>
 
@@ -17,17 +21,30 @@
     </div>
   </div>
   <nav class="nav">
+    <a href="#/library" data-route="library" class="nav-item">
+      <span class="nav-ico">◫</span><span>知识库概览</span><span class="nav-num">01</span>
+    </a>
     <a href="#/materials" data-route="materials" class="nav-item">
-      <span class="nav-ico">▤</span><span>资料与解析</span><span class="nav-num">01</span>
+      <span class="nav-ico">▤</span><span>资料与解析</span><span class="nav-num">02</span>
     </a>
     <a href="#/docs" data-route="docs" class="nav-item">
-      <span class="nav-ico">▦</span><span>知识库文档</span><span class="nav-num">02</span>
+      <span class="nav-ico">▦</span><span>知识库文档</span><span class="nav-num">03</span>
     </a>
+    <a href="#/search" data-route="search" class="nav-item">
+      <span class="nav-ico">⌕</span><span>统一检索</span><span class="nav-num">04</span>
+    </a>
+    <a href="#/wiki" data-route="wiki" class="nav-item">
+      <span class="nav-ico">▧</span><span>Wiki 知识</span><span class="nav-num">05</span>
+    </a>
+    <a href="#/graph" data-route="graph" class="nav-item">
+      <span class="nav-ico">⌘</span><span>图谱探索</span><span class="nav-num">06</span>
+    </a>
+    <a href="#/agents" data-route="agents" class="nav-item"><span class="nav-ico">◇</span><span>智能体管理</span><span class="nav-num">07</span></a>
     <a href="#/qa" data-route="qa" class="nav-item">
-      <span class="nav-ico">◌</span><span>知识问答</span><span class="nav-num">03</span>
+      <span class="nav-ico">◌</span><span>知识问答</span><span class="nav-num">08</span>
     </a>
     <a href="#/bench" data-route="bench" class="nav-item">
-      <span class="nav-ico">⌘</span><span>开发诊断</span><span class="nav-num">04</span>
+      <span class="nav-ico">⌥</span><span>开发诊断</span><span class="nav-num">09</span>
     </a>
   </nav>
   <div class="sidebar-foot">
@@ -59,7 +76,12 @@
       <div class="intro-mark" aria-hidden="true"><span>文件</span><i>→</i><span>知识</span><i>→</i><span>答案</span></div>
     </div>
     <section id="view-materials" class="view"></section>
+    <section id="view-library" class="view"></section>
     <section id="view-docs" class="view"></section>
+    <section id="view-search" class="view"></section>
+    <section id="view-wiki" class="view"></section>
+    <section id="view-graph" class="view"></section>
+    <section id="view-agents" class="view"></section>
     <section id="view-qa" class="view"></section>
     <section id="view-bench" class="view"></section>
   </div>
@@ -83,8 +105,13 @@
 
 <div id="toasts" class="toasts"></div>
 
-<script src="/assets/session.js?v=20261020-docs4"></script>
-<script src="/assets/app.js?v=20261020-docs4"></script>
-<script src="/assets/views.js?v=20261020-docs4"></script>
+<script src="/assets/session.js?v=20261021-agents2"></script>
+<script src="/assets/app.js?v=20261021-agents2"></script>
+<script src="/assets/explorer.js?v=20261021-agents2"></script>
+<script src="/assets/library-search.js?v=20261021-agents2"></script>
+<script src="/assets/wiki-view.js?v=20261021-agents2"></script>
+<script src="/assets/graph-view.js?v=20261021-wiki-workspace4"></script>
+<script src="/assets/agent-view.js?v=20261021-agents3"></script>
+<script src="/assets/views.js?v=20261021-agents2"></script>
 </body>
 </html>

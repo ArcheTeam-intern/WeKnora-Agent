@@ -136,6 +136,7 @@ def test_tools_marks_destructive_entries(client, monkeypatch):
             {"name": "search_knowledge", "description": "d", "inputSchema": {"type": "object"}},
             {"name": "ingest_document", "description": "d", "inputSchema": {"type": "object"}},
             {"name": "read_document", "description": "d", "inputSchema": {"type": "object"}},
+            {"name": "wiki_workspace", "description": "d", "inputSchema": {"type": "object"}},
         ]}}
     monkeypatch.setattr(webapp, "_mcp_rpc", fake_rpc)
 
@@ -145,6 +146,31 @@ def test_tools_marks_destructive_entries(client, monkeypatch):
     assert tools["search_knowledge"]["destructive"] is False
     assert tools["ingest_document"]["destructive"] is True
     assert tools["read_document"]["destructive"] is False
+    assert tools["wiki_workspace"]["destructive"] is True
+
+
+def test_ask_relays_selected_agent_without_replacing_it_by_a_native_mode(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        seen.update(arguments)
+        assert name == "ask"
+        return {"ok": True, "result": {"answer": "ok", "agent_id": "agent-demo", "session_id": "s-new"}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.post("/api/ask", headers=HEADERS, json={"question": "q", "agent_id": "agent-demo"})
+    assert r.status_code == 200
+    assert seen == {"question": "q", "agent_id": "agent-demo"}
+    assert "agent-demo" in r.text
+
+
+def test_ask_relays_explicit_knowledge_scope_with_selected_agent(client, monkeypatch):
+    seen = {}
+    async def fake_call(name, arguments, headers, timeout=60):
+        seen.update(arguments)
+        return {"ok": True, "result": {"answer": "ok"}}
+    monkeypatch.setattr(webapp, "_call_tool", fake_call)
+    r = client.post("/api/ask", headers=HEADERS, json={"question": "q", "agent_id": "agent-demo", "knowledge_base_ids": ["kb-1"]})
+    assert r.status_code == 200
+    assert seen["knowledge_base_ids"] == ["kb-1"]
 
 
 def test_run_tool_reports_duration_and_error_code(client, monkeypatch):
